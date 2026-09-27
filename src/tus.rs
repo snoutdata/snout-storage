@@ -115,7 +115,7 @@ fn max_size_exceeded() -> TusError {
 
 /// `<tenant>/<bucket>/<object>/<version>`, validated as upstream's `UploadId` does.
 #[derive(Debug, Clone)]
-struct UploadId {
+pub(crate) struct UploadId {
 	tenant: String,
 	bucket: String,
 	object: String,
@@ -135,7 +135,7 @@ impl UploadId {
 		Ok(Self { tenant: tenant.into(), bucket: bucket.into(), object: object.into(), version: version.into() })
 	}
 
-	fn parse(id: &str) -> Result<Self, StorageError> {
+	pub(crate) fn parse(id: &str) -> Result<Self, StorageError> {
 		let parts: Vec<&str> = id.split('/').collect();
 		if parts.len() < 3 {
 			return Err(StorageError::new(400, "InvalidUploadId", "Invalid upload id"));
@@ -151,7 +151,7 @@ impl UploadId {
 
 /// tus's `Metadata.parse`: `key base64,key base64,key`; keys ASCII without spaces or commas,
 /// unique; values padded base64.
-fn parse_metadata(header: &str) -> Option<Vec<(String, Option<String>)>> {
+pub(crate) fn parse_metadata(header: &str) -> Option<Vec<(String, Option<String>)>> {
 	use base64::Engine;
 	if header.trim().is_empty() {
 		return None;

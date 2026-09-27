@@ -1297,7 +1297,7 @@ fn encode_cursor(start_after: &str, order: Option<&str>, column: Option<&str>, c
 }
 
 #[derive(Default)]
-struct Cursor {
+pub(crate) struct Cursor {
 	start_after: Option<String>,
 	order: Option<String>,
 	column: Option<String>,
@@ -1306,7 +1306,7 @@ struct Cursor {
 
 /// `decodeContinuationToken`: every line `k:value` with a known `k`, the order `asc` unless the
 /// token says otherwise, anything else refused.
-fn decode_cursor(token: &str) -> Result<Cursor, StorageError> {
+pub(crate) fn decode_cursor(token: &str) -> Result<Cursor, StorageError> {
 	use base64::Engine;
 	let bytes = base64::engine::general_purpose::STANDARD_NO_PAD.decode(token.trim_end_matches('=')).unwrap_or_default();
 	let text = String::from_utf8_lossy(&bytes).to_string();
