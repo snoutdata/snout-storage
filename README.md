@@ -73,6 +73,5 @@ S3 credentials come from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SE
 ## Development
 
 `bash scripts/test.sh` runs the checks in a container; Docker or Podman is the only thing you need.
-See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 Licensed under the [Apache License 2.0](./LICENSE). Security reports: [SECURITY.md](./SECURITY.md).
