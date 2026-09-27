@@ -197,24 +197,6 @@ impl Pools {
 		scope.become_caller(caller, facts).await?;
 		Ok(scope)
 	}
-
-	/// The same, as the tenant's own storage admin with no caller: for the few operations
-	/// Runs "as super user", e.g. reading a bucket's limits.
-	pub async fn begin_super(
-		&self,
-		tenant: &str,
-		database_url: &str,
-	) -> Result<Scope, StorageError> {
-		let pool = self.pool(tenant, database_url).await?;
-		let client = pool.get().await.map_err(|_| StorageError::internal())?;
-		let mut scope = Scope {
-			client: Some(client),
-			open: false,
-		};
-		scope.execute_batch("BEGIN").await?;
-		scope.open = true;
-		Ok(scope)
-	}
 }
 
 /// An open transaction. Commit it, or it is abandoned: dropping an unfinished one closes its
