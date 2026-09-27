@@ -78,7 +78,7 @@ impl Ctx {
 }
 
 /// A key this server minted is trusted for its claims without re-verifying the signature.
-fn decode_unverified(token: &str) -> Map<String, Value> {
+pub(crate) fn decode_unverified(token: &str) -> Map<String, Value> {
 	use base64::Engine;
 	token
 		.split('.')

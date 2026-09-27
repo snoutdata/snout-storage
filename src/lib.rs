@@ -23,3 +23,35 @@ pub mod s3;
 pub mod sigv4;
 pub mod tenants;
 pub mod tus;
+
+/// Entry points for the fuzz targets (`packages/stack/fuzz`): each parser of untrusted input,
+/// called the way a request calls it. Not an API; nothing here is stable.
+#[doc(hidden)]
+pub mod fuzz {
+	/// What a request carries in its headers, path and body fields.
+	pub fn request(input: &str) {
+		let _ = crate::tus::parse_metadata(input);
+		let _ = crate::tus::UploadId::parse(input);
+		let _ = crate::objects::decode_cursor(input);
+		let _ = crate::objects::parse_user_metadata(input);
+		let _ = crate::objects::content_disposition(input);
+		let _ = crate::limits::is_valid_bucket_name(input);
+		let _ = crate::limits::is_valid_key(input);
+		let _ = crate::limits::parse_file_size(input);
+		let _ = crate::limits::mime_allowed(input, &["image/*".into(), "text/plain".into()]);
+		let _ = crate::s3::parse_http_date(input);
+		let _ = crate::app::decode_unverified(input);
+	}
+
+	/// A bearer token, against a secret and no JWKS.
+	pub fn token(input: &str) {
+		let _ = crate::jwt::verify(input, "a-secret-of-at-least-32-characters!!", &[]);
+	}
+
+	/// What S3 (or anything answering as S3) sends back.
+	pub fn s3_response(input: &str) {
+		let _ = crate::s3::xml_tag(input, "Code");
+		let _ = crate::s3::xml_blocks(input, "Part");
+		let _ = crate::s3::xml_unescape(input);
+	}
+}

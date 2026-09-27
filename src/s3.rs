@@ -161,15 +161,27 @@ impl S3 {
 		// upload on a fleet host: "Content-MD5 OR x-amz-checksum- HTTP header is required"), and
 		// S3 then checks the bytes against it.
 		let mut headers = headers.to_vec();
+		let mut md5_sent = false;
 		if method == "PUT"
 			&& let Some(bytes) = &body
 			&& !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-md5"))
 		{
-			let md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, Md5::digest(bytes));
+			// On a blocking thread: a part is 16 MiB, and hashing it on this task stalled reading
+			// the next part and sending the ones in flight. Parts in flight now hash in parallel.
+			let part = bytes.clone();
+			let md5 = tokio::task::spawn_blocking(move || {
+				base64::Engine::encode(&base64::engine::general_purpose::STANDARD, Md5::digest(&part))
+			})
+			.await
+			.map_err(transport)?;
 			headers.push(("content-md5".into(), md5));
+			md5_sent = true;
 		}
 		let headers = headers.as_slice();
 		let payload_hash = match &body {
+			// A PUT carrying Content-MD5 is signed UNSIGNED-PAYLOAD, as S3 allows: S3 checks the bytes
+			// against the MD5, so a second full pass for SHA-256 bought nothing but time.
+			Some(_) if md5_sent => UNSIGNED_PAYLOAD.into(),
 			Some(bytes) => hex::encode(Sha256::digest(bytes)),
 			None if method == "PUT" || method == "POST" => UNSIGNED_PAYLOAD.into(),
 			None => EMPTY_SHA256.into(),
@@ -330,17 +342,32 @@ impl S3 {
 		let mut in_flight = FuturesOrdered::new();
 		let mut number = 1u32;
 		in_flight.push_back(self.upload_part(path, upload_id, number, first));
-		while let Some((part, _)) = parts.next_part().await? {
-			while in_flight.len() >= self.queue_size {
-				if let Some(done) = in_flight.next().await {
-					etags.push(done?);
+		let mut reading = true;
+		// Reading the next part and sending the ones in flight happen AT ONCE. A future in
+		// `in_flight` only makes progress while it is polled, so awaiting the body alone left every
+		// queued part idle until the queue filled: reading and sending took turns, and a 1 GiB
+		// upload took 72 s where the network allowed about 20. Dropping `next_part` when a part
+		// finishes first loses nothing: it is only ever waiting on the body stream, which is
+		// cancel-safe, and every chunk it took is already in the reader.
+		loop {
+			if reading && in_flight.len() < self.queue_size {
+				tokio::select! {
+					next = parts.next_part() => match next? {
+						Some((part, _)) => {
+							number += 1;
+							in_flight.push_back(self.upload_part(path, upload_id, number, part));
+						}
+						None => reading = false,
+					},
+					Some(done) = in_flight.next(), if !in_flight.is_empty() => etags.push(done?),
+				}
+			} else {
+				match in_flight.next().await {
+					Some(done) => etags.push(done?),
+					None if reading => continue,
+					None => break,
 				}
 			}
-			number += 1;
-			in_flight.push_back(self.upload_part(path, upload_id, number, part));
-		}
-		while let Some(done) = in_flight.next().await {
-			etags.push(done?);
 		}
 		Ok(etags)
 	}
@@ -539,8 +566,15 @@ where
 		if self.pending.is_empty() {
 			return Ok(None);
 		}
-		let take = self.pending.len().min(self.size);
-		let part = self.pending.split_to(take).freeze();
+		// Each part leaves with an allocation of its own, and only the overflow (at most one
+		// incoming chunk) is copied into the next buffer. `split_to` would keep the part and the
+		// bytes after it in ONE allocation, and growing that shared buffer while earlier parts
+		// were still in flight allocated a fresh one of about twice the size each time: a 1 GiB
+		// upload peaked at 316 MiB where two 16 MiB parts in flight should need about 50.
+		let rest = if self.pending.len() > self.size { self.pending.split_off(self.size) } else { BytesMut::new() };
+		let mut next = BytesMut::with_capacity(if self.ended { rest.len() } else { self.size + 1024 * 1024 });
+		next.extend_from_slice(&rest);
+		let part = std::mem::replace(&mut self.pending, next).freeze();
 		Ok(Some((part, self.ended && self.pending.is_empty())))
 	}
 }
@@ -631,7 +665,7 @@ pub fn xml_tag(xml: &str, name: &str) -> Option<String> {
 }
 
 /// The inner text of every `<name>…</name>` element, in order.
-fn xml_blocks<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+pub(crate) fn xml_blocks<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
 	let open = format!("<{name}>");
 	let close = format!("</{name}>");
 	let mut out = Vec::new();
@@ -648,7 +682,7 @@ fn xml_blocks<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
 }
 
 /// XML's five named entities and numeric references (MinIO writes `&#34;` in an ETag).
-fn xml_unescape(text: &str) -> String {
+pub(crate) fn xml_unescape(text: &str) -> String {
 	let mut out = String::with_capacity(text.len());
 	let mut rest = text;
 	while let Some(at) = rest.find('&') {
