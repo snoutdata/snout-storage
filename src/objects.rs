@@ -1520,31 +1520,46 @@ async fn empty_bucket(State(app): State<AppState>, method: Method, uri: Uri, hea
 			return Err(StorageError::no_such_key());
 		}
 	}
+	// **Deliberately, and the one place this differs from upstream on who may do what:** the
+	// objects are deleted AS THE CALLER, so the project's delete policy decides every row. Upstream
+	// checked the first object only and then deleted everything as the service role, which let a
+	// user allowed to delete one file of their own empty the whole bucket (diff/authz.js, "B
+	// empties the bucket"). The batches walk the ids the caller can see, so rows it may see but not
+	// delete are stepped over rather than ending the job.
 	let app_bg = app.clone();
 	let tenant = ctx.tenant.clone();
-	let service = ctx.service_caller();
+	let caller = ctx.caller.clone();
 	let facts = ctx.facts.clone();
 	tokio::spawn(async move {
+		let mut after: Option<uuid::Uuid> = None;
 		loop {
 			let batch = async {
-				let scope = app_bg.pools.begin(&tenant.id, &tenant.database_url, &service, &facts).await?;
-				let rows = scope
+				let scope = app_bg.pools.begin(&tenant.id, &tenant.database_url, &caller, &facts).await?;
+				let ids: Vec<uuid::Uuid> = scope
 					.query(
-						"DELETE FROM objects WHERE id IN (SELECT id FROM objects WHERE bucket_id = $1 AND created_at < $2 LIMIT 1000) RETURNING name, version",
-						&[&id, &before],
+						"SELECT id FROM objects WHERE bucket_id = $1 AND created_at < $2 AND ($3::uuid IS NULL OR id > $3) ORDER BY id LIMIT 1000",
+						&[&id, &before, &after],
 					)
-					.await?;
+					.await?
+					.iter()
+					.map(|r| r.get(0))
+					.collect();
+				let Some(last) = ids.last().copied() else {
+					scope.commit().await?;
+					return Ok::<Option<uuid::Uuid>, StorageError>(None);
+				};
+				let rows = scope.query("DELETE FROM objects WHERE id = ANY($1) RETURNING name, version", &[&ids]).await?;
 				let keys: Vec<String> = rows.iter().map(|r| s3_key(&tenant.id, &id, r.get::<_, &str>(0), r.get::<_, Option<&str>>(1))).collect();
 				if !keys.is_empty() {
 					app_bg.s3.delete_many(&keys).await?;
 				}
 				scope.commit().await?;
-				Ok::<usize, StorageError>(keys.len())
+				Ok(Some(last))
 			}
 			.await;
 			match batch {
-				Ok(0) => break,
-				Ok(_) => continue,
+				Ok(None) => break,
+				Ok(Some(last)) => after = Some(last),
 				Err(error) => {
 					tracing::error!(bucket = %id, error = %error.message, "empty bucket stopped");
 					break;
