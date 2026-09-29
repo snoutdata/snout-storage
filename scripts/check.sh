@@ -21,9 +21,17 @@ exec bash "$here/dev.sh" bash -c '
 	set -euo pipefail
 	echo "== cargo deny"
 	cargo deny --locked check licenses bans sources advisories
+	# snout-functions is a workspace of its own (functions/Cargo.toml says why), with its own
+	# lockfile and policy (cargo-deny reads functions/deny.toml, beside the manifest).
+	echo "== cargo deny (functions)"
+	cargo deny --manifest-path functions/Cargo.toml --locked check licenses bans sources advisories
 	if [ -z "'"$fast"'" ]; then
 		echo "== cargo audit"
 		cargo audit --db /cache/advisory/rustsec --deny warnings
+		echo "== cargo audit (functions)"
+		# The same four advisories functions/deny.toml ignores, each with its reason there.
+		cargo audit --db /cache/advisory/rustsec --deny warnings --file functions/Cargo.lock \
+			--ignore RUSTSEC-2026-0285 --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2023-0071
 	fi
 	echo "== gitleaks"
 	# --no-git: the directory as it will be mirrored, which is what a reader of the public
