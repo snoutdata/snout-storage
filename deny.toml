@@ -10,6 +10,8 @@ all-features = true
 allow = [
 	"MIT",
 	"MIT-0",
+	# Zero-clause BSD: public-domain equivalent (quoted_printable, the mail encoder).
+	"0BSD",
 	"Apache-2.0",
 	"Apache-2.0 WITH LLVM-exception",
 	"BSD-2-Clause",
