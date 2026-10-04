@@ -85,7 +85,11 @@ pub enum MigrationError {
 		expected: String,
 	},
 	#[error("migration {id} ({name}) failed and was rolled back; nothing after it ran: {reason}")]
-	Failed { id: i32, name: String, reason: String },
+	Failed {
+		id: i32,
+		name: String,
+		reason: String,
+	},
 }
 
 fn literal(value: &str) -> String {
@@ -202,7 +206,9 @@ async fn run_locked(
 			client.batch_execute(migration.sql).await?;
 			client
 				.execute(
-					&format!("INSERT INTO {schema}.migrations (id, name, hash) VALUES ($1, $2, $3)"),
+					&format!(
+						"INSERT INTO {schema}.migrations (id, name, hash) VALUES ($1, $2, $3)"
+					),
 					&[&migration.id, &migration.name, &migration.hash()],
 				)
 				.await?;

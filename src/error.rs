@@ -227,7 +227,10 @@ impl IntoResponse for StorageError {
 		};
 		(
 			status,
-			[(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+			[(
+				axum::http::header::CONTENT_TYPE,
+				"application/json; charset=utf-8",
+			)],
 			body.to_string(),
 		)
 			.into_response()

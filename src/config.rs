@@ -132,8 +132,16 @@ impl Config {
 				// there and refuse uploads, not crash-loop. Empty means none (`S3::send`).
 				bucket: first(env, &["STORAGE_S3_BUCKET", "GLOBAL_S3_BUCKET"]).unwrap_or_default(),
 				// With no bucket nothing is signed, so the default is never used for a request.
-				region: first(env, &["STORAGE_S3_REGION", "REGION", "AWS_REGION", "AWS_DEFAULT_REGION"])
-					.unwrap_or_else(|| "us-east-1".into()),
+				region: first(
+					env,
+					&[
+						"STORAGE_S3_REGION",
+						"REGION",
+						"AWS_REGION",
+						"AWS_DEFAULT_REGION",
+					],
+				)
+				.unwrap_or_else(|| "us-east-1".into()),
 				endpoint: first(env, &["STORAGE_S3_ENDPOINT", "GLOBAL_S3_ENDPOINT"]),
 				force_path_style: first(
 					env,
@@ -142,7 +150,8 @@ impl Config {
 				.as_deref() == Some("true"),
 				part_size: number(env, &["STORAGE_S3_UPLOAD_PART_SIZE"], 16 * 1024 * 1024)?,
 				queue_size: number(env, &["STORAGE_S3_UPLOAD_QUEUE_SIZE"], 2)?,
-				accept_invalid_certs: first(env, &["NODE_TLS_REJECT_UNAUTHORIZED"]).as_deref() == Some("0"),
+				accept_invalid_certs: first(env, &["NODE_TLS_REJECT_UNAUTHORIZED"]).as_deref()
+					== Some("0"),
 			},
 			install_roles: first(env, &["DB_INSTALL_ROLES"]).as_deref() == Some("true"),
 			anon_role: first(env, &["DB_ANON_ROLE"]).unwrap_or_else(|| "anon".into()),
@@ -174,15 +183,30 @@ impl Config {
 			)
 			.as_deref() == Some("true"),
 			imgproxy_url: first(env, &["IMGPROXY_URL"]),
-			image_size_min: number(env, &["IMAGE_TRANSFORMATION_LIMIT_MIN_SIZE", "IMG_LIMITS_MIN_SIZE"], 1)?,
-			image_size_max: number(env, &["IMAGE_TRANSFORMATION_LIMIT_MAX_SIZE", "IMG_LIMITS_MAX_SIZE"], 2000)?,
+			image_size_min: number(
+				env,
+				&["IMAGE_TRANSFORMATION_LIMIT_MIN_SIZE", "IMG_LIMITS_MIN_SIZE"],
+				1,
+			)?,
+			image_size_max: number(
+				env,
+				&["IMAGE_TRANSFORMATION_LIMIT_MAX_SIZE", "IMG_LIMITS_MAX_SIZE"],
+				2000,
+			)?,
 			imgproxy_timeout_s: number(env, &["IMGPROXY_REQUEST_TIMEOUT"], 15)?,
-			private_asset_endpoint: first(env, &["STORAGE_S3_PRIVATE_ASSET_ENDPOINT", "GLOBAL_S3_PRIVATE_ASSET_ENDPOINT"]),
+			private_asset_endpoint: first(
+				env,
+				&[
+					"STORAGE_S3_PRIVATE_ASSET_ENDPOINT",
+					"GLOBAL_S3_PRIVATE_ASSET_ENDPOINT",
+				],
+			),
 			tus_path: first(env, &["TUS_URL_PATH"]).unwrap_or_else(|| "/upload/resumable".into()),
 			tus_part_size_mb: number(env, &["TUS_PART_SIZE"], 50)?,
 			tus_url_expiry_ms: number(env, &["TUS_URL_EXPIRY_MS"], 3_600_000)?,
 			tus_allow_s3_tags: first(env, &["TUS_ALLOW_S3_TAGS"]).as_deref() != Some("false"),
-			allow_forwarded_prefix: first(env, &["REQUEST_ALLOW_X_FORWARDED_PATH"]).as_deref() == Some("true"),
+			allow_forwarded_prefix: first(env, &["REQUEST_ALLOW_X_FORWARDED_PATH"]).as_deref()
+				== Some("true"),
 			public_url: first(env, &["STORAGE_PUBLIC_URL"]),
 		})
 	}

@@ -286,7 +286,11 @@ pub fn public_router(state: AppState) -> Router {
 			"/s3/{*rest}",
 			any(|| async { StorageError::s3_protocol_not_supported() }),
 		)
-		.merge(if state.config.image_transformation { crate::render::routes() } else { Router::new() })
+		.merge(if state.config.image_transformation {
+			crate::render::routes()
+		} else {
+			Router::new()
+		})
 		.merge(crate::tus::routes(&state.config.tus_path))
 		.merge(crate::objects::routes())
 		.fallback(route_not_found)
