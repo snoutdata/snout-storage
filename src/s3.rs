@@ -44,13 +44,21 @@ impl From<S3Failure> for StorageError {
 		if failure.status >= 500 || failure.status == 0 {
 			tracing::error!(status = failure.status, code = %failure.code, message = %failure.message, "s3");
 		}
-		let status = if failure.status == 0 { 500 } else { failure.status };
+		let status = if failure.status == 0 {
+			500
+		} else {
+			failure.status
+		};
 		StorageError::new(status, "S3Error", failure.code).with_legacy_text(failure.message)
 	}
 }
 
 fn transport(error: impl std::fmt::Display) -> S3Failure {
-	S3Failure { status: 0, code: "InternalError".into(), message: error.to_string() }
+	S3Failure {
+		status: 0,
+		code: "InternalError".into(),
+		message: error.to_string(),
+	}
 }
 
 /// One part of a multipart upload, as `ListParts` reports it.
@@ -100,14 +108,23 @@ impl S3 {
 	pub fn new(options: S3Options) -> Result<Self, String> {
 		let (scheme, endpoint_host) = match &options.endpoint {
 			Some(endpoint) => {
-				let (scheme, rest) = endpoint.split_once("://").ok_or_else(|| format!("STORAGE_S3_ENDPOINT has no scheme: {endpoint}"))?;
+				let (scheme, rest) = endpoint
+					.split_once("://")
+					.ok_or_else(|| format!("STORAGE_S3_ENDPOINT has no scheme: {endpoint}"))?;
 				(scheme.to_string(), rest.trim_end_matches('/').to_string())
 			}
-			None => ("https".to_string(), format!("s3.{}.amazonaws.com", options.region)),
+			None => (
+				"https".to_string(),
+				format!("s3.{}.amazonaws.com", options.region),
+			),
 		};
 		// A bucket with a dot cannot be a TLS host name under the wildcard certificate.
 		let path_style = options.force_path_style || options.bucket.contains('.');
-		let host = if path_style { endpoint_host } else { format!("{}.{endpoint_host}", options.bucket) };
+		let host = if path_style {
+			endpoint_host
+		} else {
+			format!("{}.{endpoint_host}", options.bucket)
+		};
 		let http = reqwest::Client::builder()
 			.connect_timeout(Duration::from_secs(10))
 			.pool_idle_timeout(Duration::from_secs(60))
@@ -131,18 +148,28 @@ impl S3 {
 	/// refuses with this, which is the log line that says why uploads fail there.
 	fn bucket_configured(&self) -> Result<(), S3Failure> {
 		if self.bucket.is_empty() {
-			return Err(transport("STORAGE_S3_BUCKET is not set: this host has no storage bucket"));
+			return Err(transport(
+				"STORAGE_S3_BUCKET is not set: this host has no storage bucket",
+			));
 		}
 		Ok(())
 	}
 
 	fn path(&self, key: &str) -> String {
 		let key = sigv4::uri_encode(key, true);
-		if self.path_style { format!("/{}/{key}", sigv4::uri_encode(&self.bucket, false)) } else { format!("/{key}") }
+		if self.path_style {
+			format!("/{}/{key}", sigv4::uri_encode(&self.bucket, false))
+		} else {
+			format!("/{key}")
+		}
 	}
 
 	fn bucket_path(&self) -> String {
-		if self.path_style { format!("/{}", sigv4::uri_encode(&self.bucket, false)) } else { "/".into() }
+		if self.path_style {
+			format!("/{}", sigv4::uri_encode(&self.bucket, false))
+		} else {
+			"/".into()
+		}
 	}
 
 	/// One signed request. `body` is sent with its SHA-256 when it is in memory.
@@ -164,13 +191,18 @@ impl S3 {
 		let mut md5_sent = false;
 		if method == "PUT"
 			&& let Some(bytes) = &body
-			&& !headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("content-md5"))
+			&& !headers
+				.iter()
+				.any(|(name, _)| name.eq_ignore_ascii_case("content-md5"))
 		{
 			// On a blocking thread: a part is 16 MiB, and hashing it on this task stalled reading
 			// the next part and sending the ones in flight. Parts in flight now hash in parallel.
 			let part = bytes.clone();
 			let md5 = tokio::task::spawn_blocking(move || {
-				base64::Engine::encode(&base64::engine::general_purpose::STANDARD, Md5::digest(&part))
+				base64::Engine::encode(
+					&base64::engine::general_purpose::STANDARD,
+					Md5::digest(&part),
+				)
 			})
 			.await
 			.map_err(transport)?;
@@ -188,7 +220,14 @@ impl S3 {
 		};
 		let amz_date = amz_date(OffsetDateTime::now_utc());
 		let signed = sigv4::sign(
-			&sigv4::Request { method, host: &self.host, path, query, headers, payload_sha256: &payload_hash },
+			&sigv4::Request {
+				method,
+				host: &self.host,
+				path,
+				query,
+				headers,
+				payload_sha256: &payload_hash,
+			},
 			&credentials,
 			&self.region,
 			"s3",
@@ -226,18 +265,29 @@ impl S3 {
 			_ => "UnknownError".into(),
 		});
 		let message = xml_tag(&text, "Message").unwrap_or_else(|| code.clone());
-		Err(S3Failure { status, code, message })
+		Err(S3Failure {
+			status,
+			code,
+			message,
+		})
 	}
 
 	/// `GetObject`, the body left streaming. `Range`, `If-None-Match` and `If-Modified-Since`
 	/// pass through, as upstream passes them.
-	pub async fn get(&self, key: &str, conditional: &[(String, String)]) -> Result<reqwest::Response, S3Failure> {
-		let response = self.send("GET", &self.path(key), &[], conditional, None).await?;
+	pub async fn get(
+		&self,
+		key: &str,
+		conditional: &[(String, String)],
+	) -> Result<reqwest::Response, S3Failure> {
+		let response = self
+			.send("GET", &self.path(key), &[], conditional, None)
+			.await?;
 		Self::check(response).await
 	}
 
 	pub async fn head(&self, key: &str) -> Result<Head, S3Failure> {
-		let response = Self::check(self.send("HEAD", &self.path(key), &[], &[], None).await?).await?;
+		let response =
+			Self::check(self.send("HEAD", &self.path(key), &[], &[], None).await?).await?;
 		Ok(head_from(response.headers()))
 	}
 
@@ -255,32 +305,73 @@ impl S3 {
 			}
 			xml.push_str("</Delete>");
 			let body = Bytes::from(xml);
-			let md5 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, Md5::digest(&body));
-			let headers = [("content-md5".to_string(), md5), ("content-type".to_string(), "application/xml".to_string())];
-			let response = Self::check(self.send("POST", &self.bucket_path(), &[("delete".into(), String::new())], &headers, Some(body)).await?).await?;
+			let md5 = base64::Engine::encode(
+				&base64::engine::general_purpose::STANDARD,
+				Md5::digest(&body),
+			);
+			let headers = [
+				("content-md5".to_string(), md5),
+				("content-type".to_string(), "application/xml".to_string()),
+			];
+			let response = Self::check(
+				self.send(
+					"POST",
+					&self.bucket_path(),
+					&[("delete".into(), String::new())],
+					&headers,
+					Some(body),
+				)
+				.await?,
+			)
+			.await?;
 			let text = response.text().await.unwrap_or_default();
 			if let Some(code) = xml_tag(&text, "Code") {
-				return Err(S3Failure { status: 500, code, message: xml_tag(&text, "Message").unwrap_or_default() });
+				return Err(S3Failure {
+					status: 500,
+					code,
+					message: xml_tag(&text, "Message").unwrap_or_default(),
+				});
 			}
 		}
 		Ok(())
 	}
 
 	/// `CopyObject`; with `replace`, the copy gets new content type and cache control.
-	pub async fn copy(&self, from: &str, to: &str, replace: Option<(&str, &str)>) -> Result<(String, Option<OffsetDateTime>), S3Failure> {
-		let mut headers = vec![("x-amz-copy-source".to_string(), format!("{}/{}", sigv4::uri_encode(&self.bucket, false), sigv4::uri_encode(from, true)))];
+	pub async fn copy(
+		&self,
+		from: &str,
+		to: &str,
+		replace: Option<(&str, &str)>,
+	) -> Result<(String, Option<OffsetDateTime>), S3Failure> {
+		let mut headers = vec![(
+			"x-amz-copy-source".to_string(),
+			format!(
+				"{}/{}",
+				sigv4::uri_encode(&self.bucket, false),
+				sigv4::uri_encode(from, true)
+			),
+		)];
 		if let Some((content_type, cache_control)) = replace {
 			headers.push(("x-amz-metadata-directive".into(), "REPLACE".into()));
 			headers.push(("content-type".into(), content_type.into()));
 			headers.push(("cache-control".into(), cache_control.into()));
 		}
-		let response = Self::check(self.send("PUT", &self.path(to), &[], &headers, Some(Bytes::new())).await?).await?;
+		let response = Self::check(
+			self.send("PUT", &self.path(to), &[], &headers, Some(Bytes::new()))
+				.await?,
+		)
+		.await?;
 		let text = response.text().await.unwrap_or_default();
 		if let Some(code) = xml_tag(&text, "Code") {
-			return Err(S3Failure { status: 500, code, message: xml_tag(&text, "Message").unwrap_or_default() });
+			return Err(S3Failure {
+				status: 500,
+				code,
+				message: xml_tag(&text, "Message").unwrap_or_default(),
+			});
 		}
 		let etag = xml_tag(&text, "ETag").unwrap_or_default();
-		let modified = xml_tag(&text, "LastModified").and_then(|t| OffsetDateTime::parse(&t, &Rfc3339).ok());
+		let modified =
+			xml_tag(&text, "LastModified").and_then(|t| OffsetDateTime::parse(&t, &Rfc3339).ok());
 		Ok((etag, modified))
 	}
 
@@ -289,40 +380,87 @@ impl S3 {
 	/// a single `PutObject` when everything fits in the first. Returns the bytes read; stops with
 	/// `EntityTooLarge` the moment `limit` is passed, aborting what was started. The caller HEADs
 	/// the key for the metadata it records.
-	pub async fn upload<S, E>(&self, key: &str, body: S, content_type: &str, cache_control: &str, limit: u64) -> Result<u64, StorageError>
+	pub async fn upload<S, E>(
+		&self,
+		key: &str,
+		body: S,
+		content_type: &str,
+		cache_control: &str,
+		limit: u64,
+	) -> Result<u64, StorageError>
 	where
 		S: Stream<Item = Result<Bytes, E>> + Unpin,
 		E: std::fmt::Display,
 	{
-		let mut parts = PartReader { body, pending: BytesMut::new(), ended: false, total: 0, limit, size: self.part_size };
-		let headers = [("content-type".to_string(), content_type.to_string()), ("cache-control".to_string(), cache_control.to_string())];
+		let mut parts = PartReader {
+			body,
+			pending: BytesMut::new(),
+			ended: false,
+			total: 0,
+			limit,
+			size: self.part_size,
+		};
+		let headers = [
+			("content-type".to_string(), content_type.to_string()),
+			("cache-control".to_string(), cache_control.to_string()),
+		];
 		let (first, last) = parts.next_part().await?.unwrap_or((Bytes::new(), true));
 		if last {
-			let response = self.send("PUT", &self.path(key), &[], &headers, Some(first)).await?;
+			let response = self
+				.send("PUT", &self.path(key), &[], &headers, Some(first))
+				.await?;
 			Self::check(response).await?;
 			return Ok(parts.total);
 		}
 
 		let path = self.path(key);
-		let created = Self::check(self.send("POST", &path, &[("uploads".into(), String::new())], &headers, Some(Bytes::new())).await?).await?;
-		let upload_id = xml_tag(&created.text().await.unwrap_or_default(), "UploadId").ok_or_else(StorageError::internal)?;
-		let result = self.upload_parts(&path, &upload_id, first, &mut parts).await;
+		let created = Self::check(
+			self.send(
+				"POST",
+				&path,
+				&[("uploads".into(), String::new())],
+				&headers,
+				Some(Bytes::new()),
+			)
+			.await?,
+		)
+		.await?;
+		let upload_id = xml_tag(&created.text().await.unwrap_or_default(), "UploadId")
+			.ok_or_else(StorageError::internal)?;
+		let result = self
+			.upload_parts(&path, &upload_id, first, &mut parts)
+			.await;
 		match result {
 			Ok(etags) => {
 				let mut xml = String::from("<CompleteMultipartUpload>");
 				for (number, etag) in etags.iter().enumerate() {
-					xml.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", number + 1, xml_escape(etag)));
+					xml.push_str(&format!(
+						"<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+						number + 1,
+						xml_escape(etag)
+					));
 				}
 				xml.push_str("</CompleteMultipartUpload>");
 				let response = self
-					.send("POST", &path, &[("uploadId".into(), upload_id.clone())], &[("content-type".into(), "application/xml".into())], Some(Bytes::from(xml)))
+					.send(
+						"POST",
+						&path,
+						&[("uploadId".into(), upload_id.clone())],
+						&[("content-type".into(), "application/xml".into())],
+						Some(Bytes::from(xml)),
+					)
 					.await?;
 				let response = Self::check(response).await?;
 				// CompleteMultipartUpload can fail inside a 200.
 				let text = response.text().await.unwrap_or_default();
 				if let Some(code) = xml_tag(&text, "Code") {
 					self.abort(&path, &upload_id).await;
-					return Err(S3Failure { status: 500, code, message: xml_tag(&text, "Message").unwrap_or_default() }.into());
+					return Err(S3Failure {
+						status: 500,
+						code,
+						message: xml_tag(&text, "Message").unwrap_or_default(),
+					}
+					.into());
 				}
 				Ok(parts.total)
 			}
@@ -333,7 +471,13 @@ impl S3 {
 		}
 	}
 
-	async fn upload_parts<S, E>(&self, path: &str, upload_id: &str, first: Bytes, parts: &mut PartReader<S>) -> Result<Vec<String>, StorageError>
+	async fn upload_parts<S, E>(
+		&self,
+		path: &str,
+		upload_id: &str,
+		first: Bytes,
+		parts: &mut PartReader<S>,
+	) -> Result<Vec<String>, StorageError>
 	where
 		S: Stream<Item = Result<Bytes, E>> + Unpin,
 		E: std::fmt::Display,
@@ -375,45 +519,100 @@ impl S3 {
 	/// A presigned GET for `key`, valid `expires` seconds (`privateAssetUrl`: what imgproxy fetches
 	/// with, holding no credential of its own). `endpoint` replaces the S3 endpoint when imgproxy
 	/// reaches S3 by another address (`STORAGE_S3_PRIVATE_ASSET_ENDPOINT`).
-	pub async fn presigned_get(&self, key: &str, expires: u64, endpoint: Option<&str>) -> Result<String, S3Failure> {
+	pub async fn presigned_get(
+		&self,
+		key: &str,
+		expires: u64,
+		endpoint: Option<&str>,
+	) -> Result<String, S3Failure> {
 		self.bucket_configured()?;
 		let credentials = self.credentials().await?;
 		let (scheme, host) = match endpoint.and_then(|e| e.split_once("://")) {
 			Some((scheme, rest)) => {
 				let base = rest.trim_end_matches('/').to_string();
-				(scheme.to_string(), if self.path_style { base } else { format!("{}.{base}", self.bucket) })
+				(
+					scheme.to_string(),
+					if self.path_style {
+						base
+					} else {
+						format!("{}.{base}", self.bucket)
+					},
+				)
 			}
 			None => (self.scheme.clone(), self.host.clone()),
 		};
 		let path = self.path(key);
-		let query = sigv4::presign(&host, &path, &[("x-id".into(), "GetObject".into())], &credentials, &self.region, &amz_date(OffsetDateTime::now_utc()), expires);
+		let query = sigv4::presign(
+			&host,
+			&path,
+			&[("x-id".into(), "GetObject".into())],
+			&credentials,
+			&self.region,
+			&amz_date(OffsetDateTime::now_utc()),
+			expires,
+		);
 		Ok(format!("{scheme}://{host}{path}?{query}"))
 	}
 
 	// ---- the raw calls TUS keeps its state with (@tus/s3-store's layout) --------------------------
 
 	/// `PutObject` of bytes in memory, with extra headers (`x-amz-meta-*`, `x-amz-tagging`, …).
-	pub async fn put(&self, key: &str, body: Bytes, headers: &[(String, String)]) -> Result<(), S3Failure> {
-		Self::check(self.send("PUT", &self.path(key), &[], headers, Some(body)).await?).await?;
+	pub async fn put(
+		&self,
+		key: &str,
+		body: Bytes,
+		headers: &[(String, String)],
+	) -> Result<(), S3Failure> {
+		Self::check(
+			self.send("PUT", &self.path(key), &[], headers, Some(body))
+				.await?,
+		)
+		.await?;
 		Ok(())
 	}
 
 	/// The whole object, in memory, with its response headers.
-	pub async fn get_bytes(&self, key: &str) -> Result<(reqwest::header::HeaderMap, Bytes), S3Failure> {
-		let response = Self::check(self.send("GET", &self.path(key), &[], &[], None).await?).await?;
+	pub async fn get_bytes(
+		&self,
+		key: &str,
+	) -> Result<(reqwest::header::HeaderMap, Bytes), S3Failure> {
+		let response =
+			Self::check(self.send("GET", &self.path(key), &[], &[], None).await?).await?;
 		let headers = response.headers().clone();
 		Ok((headers, response.bytes().await.map_err(transport)?))
 	}
 
 	/// `CreateMultipartUpload`; the upload id.
-	pub async fn create_multipart(&self, key: &str, headers: &[(String, String)]) -> Result<String, S3Failure> {
-		let response = Self::check(self.send("POST", &self.path(key), &[("uploads".into(), String::new())], headers, Some(Bytes::new())).await?).await?;
-		xml_tag(&response.text().await.unwrap_or_default(), "UploadId").ok_or_else(|| transport("CreateMultipartUpload returned no UploadId"))
+	pub async fn create_multipart(
+		&self,
+		key: &str,
+		headers: &[(String, String)],
+	) -> Result<String, S3Failure> {
+		let response = Self::check(
+			self.send(
+				"POST",
+				&self.path(key),
+				&[("uploads".into(), String::new())],
+				headers,
+				Some(Bytes::new()),
+			)
+			.await?,
+		)
+		.await?;
+		xml_tag(&response.text().await.unwrap_or_default(), "UploadId")
+			.ok_or_else(|| transport("CreateMultipartUpload returned no UploadId"))
 	}
 
 	/// `UploadPart`; the part's ETag.
-	pub async fn put_part(&self, key: &str, upload_id: &str, number: u32, bytes: Bytes) -> Result<String, StorageError> {
-		self.upload_part(&self.path(key), upload_id, number, bytes).await
+	pub async fn put_part(
+		&self,
+		key: &str,
+		upload_id: &str,
+		number: u32,
+		bytes: Bytes,
+	) -> Result<String, StorageError> {
+		self.upload_part(&self.path(key), upload_id, number, bytes)
+			.await
 	}
 
 	/// Every part uploaded so far, following `NextPartNumberMarker`, in part order.
@@ -425,12 +624,17 @@ impl S3 {
 			if let Some(marker) = &marker {
 				query.push(("part-number-marker".into(), marker.clone()));
 			}
-			let response = Self::check(self.send("GET", &self.path(key), &query, &[], None).await?).await?;
+			let response =
+				Self::check(self.send("GET", &self.path(key), &query, &[], None).await?).await?;
 			let text = response.text().await.unwrap_or_default();
 			for block in xml_blocks(&text, "Part") {
 				parts.push(Part {
-					number: xml_tag(block, "PartNumber").and_then(|n| n.parse().ok()).unwrap_or(0),
-					size: xml_tag(block, "Size").and_then(|n| n.parse().ok()).unwrap_or(0),
+					number: xml_tag(block, "PartNumber")
+						.and_then(|n| n.parse().ok())
+						.unwrap_or(0),
+					size: xml_tag(block, "Size")
+						.and_then(|n| n.parse().ok())
+						.unwrap_or(0),
 					etag: xml_tag(block, "ETag").unwrap_or_default(),
 				});
 			}
@@ -447,35 +651,92 @@ impl S3 {
 	}
 
 	/// `CompleteMultipartUpload` with the parts given.
-	pub async fn complete_multipart(&self, key: &str, upload_id: &str, parts: &[Part]) -> Result<(), StorageError> {
+	pub async fn complete_multipart(
+		&self,
+		key: &str,
+		upload_id: &str,
+		parts: &[Part],
+	) -> Result<(), StorageError> {
 		let mut xml = String::from("<CompleteMultipartUpload>");
 		for part in parts {
-			xml.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", part.number, xml_escape(&part.etag)));
+			xml.push_str(&format!(
+				"<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+				part.number,
+				xml_escape(&part.etag)
+			));
 		}
 		xml.push_str("</CompleteMultipartUpload>");
 		let response = self
-			.send("POST", &self.path(key), &[("uploadId".into(), upload_id.to_string())], &[("content-type".into(), "application/xml".into())], Some(Bytes::from(xml)))
+			.send(
+				"POST",
+				&self.path(key),
+				&[("uploadId".into(), upload_id.to_string())],
+				&[("content-type".into(), "application/xml".into())],
+				Some(Bytes::from(xml)),
+			)
 			.await?;
-		let text = Self::check(response).await?.text().await.unwrap_or_default();
+		let text = Self::check(response)
+			.await?
+			.text()
+			.await
+			.unwrap_or_default();
 		if let Some(code) = xml_tag(&text, "Code") {
-			return Err(S3Failure { status: 500, code, message: xml_tag(&text, "Message").unwrap_or_default() }.into());
+			return Err(S3Failure {
+				status: 500,
+				code,
+				message: xml_tag(&text, "Message").unwrap_or_default(),
+			}
+			.into());
 		}
 		Ok(())
 	}
 
 	pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<(), S3Failure> {
-		Self::check(self.send("DELETE", &self.path(key), &[("uploadId".into(), upload_id.to_string())], &[], None).await?).await?;
+		Self::check(
+			self.send(
+				"DELETE",
+				&self.path(key),
+				&[("uploadId".into(), upload_id.to_string())],
+				&[],
+				None,
+			)
+			.await?,
+		)
+		.await?;
 		Ok(())
 	}
 
-	async fn upload_part(&self, path: &str, upload_id: &str, number: u32, bytes: Bytes) -> Result<String, StorageError> {
-		let query = [("partNumber".to_string(), number.to_string()), ("uploadId".to_string(), upload_id.to_string())];
+	async fn upload_part(
+		&self,
+		path: &str,
+		upload_id: &str,
+		number: u32,
+		bytes: Bytes,
+	) -> Result<String, StorageError> {
+		let query = [
+			("partNumber".to_string(), number.to_string()),
+			("uploadId".to_string(), upload_id.to_string()),
+		];
 		let response = Self::check(self.send("PUT", path, &query, &[], Some(bytes)).await?).await?;
-		Ok(response.headers().get("etag").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string())
+		Ok(response
+			.headers()
+			.get("etag")
+			.and_then(|v| v.to_str().ok())
+			.unwrap_or_default()
+			.to_string())
 	}
 
 	async fn abort(&self, path: &str, upload_id: &str) {
-		if let Err(error) = self.send("DELETE", path, &[("uploadId".into(), upload_id.into())], &[], None).await {
+		if let Err(error) = self
+			.send(
+				"DELETE",
+				path,
+				&[("uploadId".into(), upload_id.into())],
+				&[],
+				None,
+			)
+			.await
+		{
 			tracing::warn!(error = %error.message, "abandoned multipart upload not aborted; the bucket's lifecycle rule collects it");
 		}
 	}
@@ -495,11 +756,22 @@ impl S3 {
 	}
 
 	async fn resolve(&self) -> Result<(Credentials, Option<OffsetDateTime>), S3Failure> {
-		if let (Ok(id), Ok(secret)) = (std::env::var("AWS_ACCESS_KEY_ID"), std::env::var("AWS_SECRET_ACCESS_KEY"))
-			&& !id.is_empty()
+		if let (Ok(id), Ok(secret)) = (
+			std::env::var("AWS_ACCESS_KEY_ID"),
+			std::env::var("AWS_SECRET_ACCESS_KEY"),
+		) && !id.is_empty()
 		{
-			let token = std::env::var("AWS_SESSION_TOKEN").ok().filter(|t| !t.is_empty());
-			return Ok((Credentials { access_key_id: id, secret_access_key: secret, session_token: token }, None));
+			let token = std::env::var("AWS_SESSION_TOKEN")
+				.ok()
+				.filter(|t| !t.is_empty());
+			return Ok((
+				Credentials {
+					access_key_id: id,
+					secret_access_key: secret,
+					session_token: token,
+				},
+				None,
+			));
 		}
 		if let Some(found) = from_config_file().await? {
 			return Ok(found);
@@ -508,7 +780,10 @@ impl S3 {
 	}
 
 	async fn imds(&self) -> Result<(Credentials, Option<OffsetDateTime>), S3Failure> {
-		let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().map_err(transport)?;
+		let client = reqwest::Client::builder()
+			.timeout(Duration::from_secs(2))
+			.build()
+			.map_err(transport)?;
 		let token = client
 			.put(format!("{IMDS}/latest/api/token"))
 			.header("x-aws-ec2-metadata-token-ttl-seconds", "21600")
@@ -519,11 +794,27 @@ impl S3 {
 			.await
 			.map_err(transport)?;
 		let base = format!("{IMDS}/latest/meta-data/iam/security-credentials/");
-		let role = client.get(&base).header("x-aws-ec2-metadata-token", &token).send().await.map_err(transport)?.text().await.map_err(transport)?;
+		let role = client
+			.get(&base)
+			.header("x-aws-ec2-metadata-token", &token)
+			.send()
+			.await
+			.map_err(transport)?
+			.text()
+			.await
+			.map_err(transport)?;
 		let role = role.lines().next().unwrap_or_default().trim().to_string();
-		let document: serde_json::Value =
-			client.get(format!("{base}{role}")).header("x-aws-ec2-metadata-token", &token).send().await.map_err(transport)?.json().await.map_err(transport)?;
-		credentials_from_json(&document, "Token").ok_or_else(|| transport("the instance metadata service returned no credentials"))
+		let document: serde_json::Value = client
+			.get(format!("{base}{role}"))
+			.header("x-aws-ec2-metadata-token", &token)
+			.send()
+			.await
+			.map_err(transport)?
+			.json()
+			.await
+			.map_err(transport)?;
+		credentials_from_json(&document, "Token")
+			.ok_or_else(|| transport("the instance metadata service returned no credentials"))
 	}
 }
 
@@ -546,7 +837,8 @@ where
 		while !self.ended && self.pending.len() < want {
 			match self.body.next().await {
 				Some(chunk) => {
-					let chunk = chunk.map_err(|e| StorageError::no_content_provided_because(e.to_string()))?;
+					let chunk = chunk
+						.map_err(|e| StorageError::no_content_provided_because(e.to_string()))?;
 					self.total += chunk.len() as u64;
 					if self.total > self.limit {
 						return Err(StorageError::entity_too_large());
@@ -571,8 +863,16 @@ where
 		// bytes after it in ONE allocation, and growing that shared buffer while earlier parts
 		// were still in flight allocated a fresh one of about twice the size each time: a 1 GiB
 		// upload peaked at 316 MiB where two 16 MiB parts in flight should need about 50.
-		let rest = if self.pending.len() > self.size { self.pending.split_off(self.size) } else { BytesMut::new() };
-		let mut next = BytesMut::with_capacity(if self.ended { rest.len() } else { self.size + 1024 * 1024 });
+		let rest = if self.pending.len() > self.size {
+			self.pending.split_off(self.size)
+		} else {
+			BytesMut::new()
+		};
+		let mut next = BytesMut::with_capacity(if self.ended {
+			rest.len()
+		} else {
+			self.size + 1024 * 1024
+		});
 		next.extend_from_slice(&rest);
 		let part = std::mem::replace(&mut self.pending, next).freeze();
 		Ok(Some((part, self.ended && self.pending.is_empty())))
@@ -589,24 +889,65 @@ async fn from_config_file() -> Result<Option<(Credentials, Option<OffsetDateTime
 	};
 	let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".into());
 	let section = ini_section(&text, &profile);
-	if let Some(command) = section.iter().find(|(k, _)| k == "credential_process").map(|(_, v)| v.clone()) {
-		let output = tokio::process::Command::new("sh").arg("-c").arg(&command).output().await.map_err(transport)?;
+	if let Some(command) = section
+		.iter()
+		.find(|(k, _)| k == "credential_process")
+		.map(|(_, v)| v.clone())
+	{
+		let output = tokio::process::Command::new("sh")
+			.arg("-c")
+			.arg(&command)
+			.output()
+			.await
+			.map_err(transport)?;
 		if !output.status.success() {
-			return Err(transport(format!("credential_process failed: {}", String::from_utf8_lossy(&output.stderr).trim())));
+			return Err(transport(format!(
+				"credential_process failed: {}",
+				String::from_utf8_lossy(&output.stderr).trim()
+			)));
 		}
-		let document: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(transport)?;
-		return credentials_from_json(&document, "SessionToken").map(Some).ok_or_else(|| transport("credential_process returned no credentials"));
+		let document: serde_json::Value =
+			serde_json::from_slice(&output.stdout).map_err(transport)?;
+		return credentials_from_json(&document, "SessionToken")
+			.map(Some)
+			.ok_or_else(|| transport("credential_process returned no credentials"));
 	}
-	let get = |name: &str| section.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
-	Ok(match (get("aws_access_key_id"), get("aws_secret_access_key")) {
-		(Some(id), Some(secret)) => Some((Credentials { access_key_id: id, secret_access_key: secret, session_token: get("aws_session_token") }, None)),
-		_ => None,
-	})
+	let get = |name: &str| {
+		section
+			.iter()
+			.find(|(k, _)| k == name)
+			.map(|(_, v)| v.clone())
+	};
+	Ok(
+		match (get("aws_access_key_id"), get("aws_secret_access_key")) {
+			(Some(id), Some(secret)) => Some((
+				Credentials {
+					access_key_id: id,
+					secret_access_key: secret,
+					session_token: get("aws_session_token"),
+				},
+				None,
+			)),
+			_ => None,
+		},
+	)
 }
 
-fn credentials_from_json(document: &serde_json::Value, token_field: &str) -> Option<(Credentials, Option<OffsetDateTime>)> {
-	let field = |name: &str| document.get(name).and_then(serde_json::Value::as_str).map(str::to_string);
-	let credentials = Credentials { access_key_id: field("AccessKeyId")?, secret_access_key: field("SecretAccessKey")?, session_token: field(token_field) };
+fn credentials_from_json(
+	document: &serde_json::Value,
+	token_field: &str,
+) -> Option<(Credentials, Option<OffsetDateTime>)> {
+	let field = |name: &str| {
+		document
+			.get(name)
+			.and_then(serde_json::Value::as_str)
+			.map(str::to_string)
+	};
+	let credentials = Credentials {
+		access_key_id: field("AccessKeyId")?,
+		secret_access_key: field("SecretAccessKey")?,
+		session_token: field(token_field),
+	};
 	let expires = field("Expiration").and_then(|t| OffsetDateTime::parse(&t, &Rfc3339).ok());
 	Some((credentials, expires))
 }
@@ -630,9 +971,16 @@ fn ini_section(text: &str, profile: &str) -> Vec<(String, String)> {
 }
 
 fn head_from(headers: &reqwest::header::HeaderMap) -> Head {
-	let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+	let text = |name: &str| {
+		headers
+			.get(name)
+			.and_then(|v| v.to_str().ok())
+			.map(str::to_string)
+	};
 	Head {
-		size: text("content-length").and_then(|v| v.parse().ok()).unwrap_or(0),
+		size: text("content-length")
+			.and_then(|v| v.parse().ok())
+			.unwrap_or(0),
 		etag: text("etag").unwrap_or_default(),
 		content_type: text("content-type").unwrap_or_else(|| "application/octet-stream".into()),
 		cache_control: text("cache-control").unwrap_or_else(|| "no-cache".into()),
@@ -642,13 +990,21 @@ fn head_from(headers: &reqwest::header::HeaderMap) -> Head {
 
 /// `Sun, 06 Nov 1994 08:49:37 GMT`.
 pub fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
-	let format = time::macros::format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
-	time::PrimitiveDateTime::parse(value, format).ok().map(|t| t.assume_utc())
+	let format = time::macros::format_description!(
+		"[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+	);
+	time::PrimitiveDateTime::parse(value, format)
+		.ok()
+		.map(|t| t.assume_utc())
 }
 
 pub fn http_date(at: OffsetDateTime) -> String {
-	let format = time::macros::format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
-	at.to_offset(time::UtcOffset::UTC).format(format).unwrap_or_default()
+	let format = time::macros::format_description!(
+		"[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+	);
+	at.to_offset(time::UtcOffset::UTC)
+		.format(format)
+		.unwrap_or_default()
 }
 
 fn amz_date(at: OffsetDateTime) -> String {
@@ -721,7 +1077,12 @@ pub(crate) fn xml_unescape(text: &str) -> String {
 }
 
 fn xml_escape(value: &str) -> String {
-	value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
+	value
+		.replace('&', "&amp;")
+		.replace('<', "&lt;")
+		.replace('>', "&gt;")
+		.replace('"', "&quot;")
+		.replace('\'', "&apos;")
 }
 
 #[cfg(test)]
@@ -731,15 +1092,25 @@ mod tests {
 	#[test]
 	fn reads_the_profile_a_host_writes() {
 		let config = "[default]\ncredential_process = cat /tmp/snoutpod-aws/credentials.json\n";
-		assert_eq!(ini_section(config, "default"), vec![("credential_process".to_string(), "cat /tmp/snoutpod-aws/credentials.json".to_string())]);
+		assert_eq!(
+			ini_section(config, "default"),
+			vec![(
+				"credential_process".to_string(),
+				"cat /tmp/snoutpod-aws/credentials.json".to_string()
+			)]
+		);
 		let named = "[default]\na = 1\n[profile x]\nb = 2\n";
-		assert_eq!(ini_section(named, "x"), vec![("b".to_string(), "2".to_string())]);
+		assert_eq!(
+			ini_section(named, "x"),
+			vec![("b".to_string(), "2".to_string())]
+		);
 	}
 
 	#[test]
 	fn reads_credential_process_output() {
 		let document = serde_json::json!({ "Version": 1, "AccessKeyId": "A", "SecretAccessKey": "S", "SessionToken": "T", "Expiration": "2026-09-26T20:00:00Z" });
-		let (credentials, expires) = credentials_from_json(&document, "SessionToken").unwrap_or_else(|| unreachable!());
+		let (credentials, expires) =
+			credentials_from_json(&document, "SessionToken").unwrap_or_else(|| unreachable!());
 		assert_eq!(credentials.session_token.as_deref(), Some("T"));
 		assert_eq!(expires.map(|e| e.hour()), Some(20));
 	}
@@ -752,9 +1123,18 @@ mod tests {
 
 	#[test]
 	fn xml() {
-		assert_eq!(xml_tag("<a><UploadId>x&amp;y</UploadId></a>", "UploadId").as_deref(), Some("x&y"));
-		assert_eq!(xml_tag("<ETag>&quot;abc&quot;</ETag>", "ETag").as_deref(), Some("\"abc\""));
-		assert_eq!(xml_tag("<ETag>&#34;abc&#x22;</ETag>", "ETag").as_deref(), Some("\"abc\""));
+		assert_eq!(
+			xml_tag("<a><UploadId>x&amp;y</UploadId></a>", "UploadId").as_deref(),
+			Some("x&y")
+		);
+		assert_eq!(
+			xml_tag("<ETag>&quot;abc&quot;</ETag>", "ETag").as_deref(),
+			Some("\"abc\"")
+		);
+		assert_eq!(
+			xml_tag("<ETag>&#34;abc&#x22;</ETag>", "ETag").as_deref(),
+			Some("\"abc\"")
+		);
 		assert_eq!(xml_unescape("a & b &bogus; &#39;"), "a & b &bogus; '");
 		assert_eq!(xml_escape("a<b>&'\""), "a&lt;b&gt;&amp;&apos;&quot;");
 	}

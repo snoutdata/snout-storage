@@ -292,15 +292,12 @@ mod tests {
 	fn hs512_is_refused_until_the_tenant_has_an_oct_key() {
 		let mut jwk = generate_url_signing_jwk();
 		jwk["alg"] = json!("HS512");
-		let key = oct_key_from_jwk(
-			&jwk,
-			Some("storage-url-signing-key_1".into()),
-		)
-		.unwrap_or(OctKey {
-			kid: None,
-			k: vec![],
-			alg: None,
-		});
+		let key =
+			oct_key_from_jwk(&jwk, Some("storage-url-signing-key_1".into())).unwrap_or(OctKey {
+				kid: None,
+				k: vec![],
+				alg: None,
+			});
 		let token = sign(
 			claims(json!({ "url": "b/o" })),
 			&SigningKey::Jwk(key.clone()),

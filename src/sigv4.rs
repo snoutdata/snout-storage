@@ -167,7 +167,10 @@ pub fn presign(
 	let scope = format!("{date}/{region}/s3/aws4_request");
 	let mut query: Vec<(String, String)> = extra_query.to_vec();
 	query.push(("X-Amz-Algorithm".into(), "AWS4-HMAC-SHA256".into()));
-	query.push(("X-Amz-Credential".into(), format!("{}/{scope}", credentials.access_key_id)));
+	query.push((
+		"X-Amz-Credential".into(),
+		format!("{}/{scope}", credentials.access_key_id),
+	));
 	query.push(("X-Amz-Date".into(), amz_date.to_string()));
 	query.push(("X-Amz-Expires".into(), expires_seconds.to_string()));
 	if let Some(token) = &credentials.session_token {
@@ -175,7 +178,8 @@ pub fn presign(
 	}
 	query.push(("X-Amz-SignedHeaders".into(), "host".into()));
 	let canonical_query = canonical_query(&query);
-	let canonical_request = format!("GET\n{path}\n{canonical_query}\nhost:{host}\n\nhost\n{UNSIGNED_PAYLOAD}");
+	let canonical_request =
+		format!("GET\n{path}\n{canonical_query}\nhost:{host}\n\nhost\n{UNSIGNED_PAYLOAD}");
 	let string_to_sign = format!(
 		"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
 		sha256_hex(canonical_request.as_bytes())
