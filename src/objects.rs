@@ -295,6 +295,80 @@ pub(crate) fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a 
 	headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+/// Whether a verified signed-URL token was issued for UPLOADING. The two kinds are signed with the
+/// same key over the same `url`, so the routes tell them apart by what each always carries: an
+/// upload token (`sign_upload_url`) always has `upsert`, a download token never does. Upstream's
+/// tokens have the same shape, so a token issued before this check still works where it was meant to.
+pub(crate) fn is_upload_token(claims: &Map<String, Value>) -> bool {
+	claims.contains_key("upsert")
+}
+
+/// The policy every response that serves an object's bytes carries when its type could run script
+/// in a browser: no script, no plugins, an opaque origin. An image or a PDF is unaffected.
+pub(crate) const ACTIVE_CONTENT_CSP: &str =
+	"default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox";
+
+/// What an object is served as. An object's type is whatever its uploader said, so HTML is served
+/// as plain text (upstream's rule, now matched without regard to case or parameters), and the other
+/// types a browser runs script from (SVG, XHTML, XML) keep their type but are served with
+/// `ACTIVE_CONTENT_CSP` and `nosniff`. Returns the type, and whether those two headers go with it.
+pub(crate) fn served_type(mime: &str) -> (String, bool) {
+	let essence = mime
+		.split(';')
+		.next()
+		.unwrap_or("")
+		.trim()
+		.to_ascii_lowercase();
+	if essence == "text/html" || essence == "application/xhtml+xml" {
+		return ("text/plain".to_string(), true);
+	}
+	let active = essence.ends_with("+xml") || essence == "text/xml" || essence == "application/xml";
+	(mime.to_string(), active)
+}
+
+/// Adds the headers `served_type` asked for.
+pub(crate) fn guard_active(headers: &mut HeaderMap, active: bool) {
+	if active {
+		headers.insert(
+			header::CONTENT_SECURITY_POLICY,
+			HeaderValue::from_static(ACTIVE_CONTENT_CSP),
+		);
+		headers.insert(
+			header::X_CONTENT_TYPE_OPTIONS,
+			HeaderValue::from_static("nosniff"),
+		);
+	}
+}
+
+/// The most a form field other than the file may hold. The file part streams; every other field is
+/// held in memory whole, by a process that serves every project on the host, so each is capped.
+/// 1 MiB is what the metadata field was already allowed (anything longer was refused after it had
+/// been read).
+const FORM_FIELD_MAX: usize = 1024 * 1024;
+/// How many fields may come before the file. The form uses at most four.
+const FORM_FIELDS_MAX: usize = 32;
+
+/// A non-file form field's text, refused as soon as it passes `FORM_FIELD_MAX`.
+async fn form_field_text(mut field: multer::Field<'_>) -> Result<String, StorageError> {
+	let mut buf: Vec<u8> = Vec::new();
+	while let Some(chunk) = field
+		.chunk()
+		.await
+		.map_err(|e| StorageError::no_content_provided_because(e.to_string()))?
+	{
+		if buf.len() + chunk.len() > FORM_FIELD_MAX {
+			return Err(StorageError::new(
+				413,
+				"EntityTooLarge",
+				"A form field exceeded the maximum allowed size",
+			)
+			.with_legacy_name("Payload too large"));
+		}
+		buf.extend_from_slice(&chunk);
+	}
+	Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// `uploadFromRequest` + `uploadNewObject` + `Uploader.upload`: the bucket's limits (as super
 /// user), the file's type and size, the key, the caller's permission, the bytes, the row.
 async fn upload(
@@ -356,6 +430,7 @@ async fn upload(
 		);
 		let mut fields: Map<String, Value> = Map::new();
 		let mut file = None;
+		let mut form_fields_seen = 0usize;
 		while let Some(field) = form
 			.next_field()
 			.await
@@ -365,11 +440,14 @@ async fn upload(
 				file = Some(field);
 				break;
 			}
+			form_fields_seen += 1;
+			if form_fields_seen > FORM_FIELDS_MAX {
+				return Err(StorageError::no_content_provided_because(format!(
+					"more than {FORM_FIELDS_MAX} form fields before the file"
+				)));
+			}
 			let field_name = field.name().unwrap_or_default().to_string();
-			let text = field
-				.text()
-				.await
-				.map_err(|e| StorageError::no_content_provided_because(e.to_string()))?;
+			let text = form_field_text(field).await?;
 			if fields.len() < 10 {
 				fields.insert(field_name, json!(text));
 			}
@@ -627,7 +705,9 @@ async fn upload_signed_object(
 	.await?;
 	let claims = jwt::verify(&token, &ctx.tenant.jwt_secret, &ctx.tenant.jwks)
 		.map_err(|e| StorageError::invalid_jwt(e.0))?;
-	if claims.get("url").and_then(Value::as_str) != Some(format!("{bucket}/{name}").as_str()) {
+	if claims.get("url").and_then(Value::as_str) != Some(format!("{bucket}/{name}").as_str())
+		|| !is_upload_token(&claims)
+	{
 		return Err(StorageError::invalid_signature("Invalid signature"));
 	}
 	let owner = claims
@@ -759,11 +839,7 @@ async fn render_asset(
 			.map(str::to_string)
 	};
 	let mime = text("content-type").unwrap_or_else(|| "application/octet-stream".into());
-	let mime = if mime.contains("text/html") {
-		"text/plain".to_string()
-	} else {
-		mime
-	};
+	let (mime, active) = served_type(&mime);
 	let etag = text("etag").unwrap_or_default();
 	let mut builder = Response::builder()
 		.status(status)
@@ -771,6 +847,9 @@ async fn render_asset(
 		.header(header::CONTENT_TYPE, mime)
 		.header(header::ETAG, &etag)
 		.header("x-robots-tag", robots_header(robots));
+	if let Some(headers) = builder.headers_mut() {
+		guard_active(headers, active);
+	}
 	if let Some(modified) = text("last-modified").and_then(|v| parse_http_date(&v)) {
 		builder = builder.header(header::LAST_MODIFIED, http_date(modified));
 	}
@@ -1007,7 +1086,7 @@ async fn get_signed_object(
 		.and_then(Value::as_str)
 		.unwrap_or_default()
 		.to_string();
-	if url != format!("{bucket}/{name}") {
+	if url != format!("{bucket}/{name}") || is_upload_token(&claims) {
 		return Err(StorageError::invalid_signature("Invalid signature"));
 	}
 	let exp = claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
@@ -1112,14 +1191,11 @@ async fn describe(
 		let headers_out = response.headers_mut();
 		headers_out.insert("accept-ranges", HeaderValue::from_static("bytes"));
 		if let Some(mime) = &mime {
-			let mime = if mime.contains("text/html") {
-				"text/plain"
-			} else {
-				mime.as_str()
-			};
-			if let Ok(value) = HeaderValue::from_str(mime) {
+			let (mime, active) = served_type(mime);
+			if let Ok(value) = HeaderValue::from_str(&mime) {
 				headers_out.insert(header::CONTENT_TYPE, value);
 			}
+			guard_active(headers_out, active);
 		}
 		if let Ok(value) = HeaderValue::from_str(&robots_header(text("xRobotsTag").as_deref())) {
 			headers_out.insert("x-robots-tag", value);
@@ -1744,6 +1820,25 @@ async fn copy_object(
 		destination_user_metadata.as_ref(),
 	)
 	.await?;
+	// The copy's type is held to the destination bucket's allowed types, as an upload to it is:
+	// otherwise a copy with a new `metadata.mimetype` serves any type from any bucket.
+	{
+		let scope = ctx.super_scope(&app).await?;
+		let found = find_bucket(&scope, &destination_bucket, false).await?;
+		scope.commit().await?;
+		let (_, _, allowed) = found.ok_or_else(StorageError::no_such_bucket)?;
+		let allowed = allowed.unwrap_or_default();
+		let mime = destination_metadata
+			.get("mimetype")
+			.and_then(Value::as_str)
+			.unwrap_or_default();
+		if !allowed.is_empty()
+			&& !is_empty_folder(&destination)
+			&& (!mime.contains('/') || !limits::mime_allowed(mime, &allowed))
+		{
+			return Err(StorageError::invalid_mime_type(mime));
+		}
+	}
 
 	let from = s3_key(&ctx.tenant.id, &bucket, &source, origin.version.as_deref());
 	let to = s3_key(
@@ -2576,5 +2671,91 @@ mod tests {
 			content_disposition("résumé \"x\".pdf"),
 			"attachment; filename=\"r_sum_ _x_.pdf\"; filename*=UTF-8''r%C3%A9sum%C3%A9%20%22x%22.pdf"
 		);
+	}
+
+	#[test]
+	fn active_types_are_never_served_as_they_were_uploaded() {
+		for html in [
+			"text/html",
+			"Text/HTML",
+			"TEXT/HTML; charset=utf-8",
+			" text/html ",
+			"application/xhtml+xml",
+		] {
+			assert_eq!(
+				served_type(html),
+				("text/plain".to_string(), true),
+				"{html}"
+			);
+		}
+		for active in [
+			"image/svg+xml",
+			"IMAGE/SVG+XML",
+			"application/xml",
+			"text/xml",
+			"application/rss+xml",
+		] {
+			assert_eq!(served_type(active), (active.to_string(), true), "{active}");
+		}
+		for inert in [
+			"image/png",
+			"application/pdf",
+			"text/plain; charset=utf-8",
+			"application/json",
+			"video/mp4",
+		] {
+			assert_eq!(served_type(inert), (inert.to_string(), false), "{inert}");
+		}
+		let mut headers = HeaderMap::new();
+		guard_active(&mut headers, true);
+		assert!(
+			headers[header::CONTENT_SECURITY_POLICY]
+				.to_str()
+				.unwrap()
+				.contains("sandbox")
+		);
+		assert_eq!(headers[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+		let mut headers = HeaderMap::new();
+		guard_active(&mut headers, false);
+		assert!(headers.is_empty());
+	}
+
+	#[test]
+	fn upload_and_download_tokens_are_told_apart() {
+		let claims = |v: Value| v.as_object().unwrap().clone();
+		assert!(is_upload_token(&claims(
+			json!({ "url": "b/o", "upsert": false, "owner": "u" })
+		)));
+		assert!(is_upload_token(&claims(
+			json!({ "url": "b/o", "upsert": true })
+		)));
+		assert!(!is_upload_token(&claims(json!({ "url": "b/o" }))));
+		assert!(!is_upload_token(&claims(
+			json!({ "url": "b/o", "transformations": "width:10" })
+		)));
+	}
+
+	#[tokio::test]
+	async fn a_form_field_is_refused_past_its_cap() {
+		async fn field_of(len: usize) -> Result<String, StorageError> {
+			let body = format!(
+				"--X\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{}\r\n--X--\r\n",
+				"a".repeat(len)
+			);
+			let stream =
+				futures_util::stream::once(
+					async move { Ok::<_, std::io::Error>(Bytes::from(body)) },
+				);
+			let mut form = multer::Multipart::new(stream, "X");
+			let field = form.next_field().await.unwrap().unwrap();
+			form_field_text(field).await
+		}
+		assert_eq!(field_of(10).await.unwrap().len(), 10);
+		assert_eq!(
+			field_of(FORM_FIELD_MAX).await.unwrap().len(),
+			FORM_FIELD_MAX
+		);
+		let refused = field_of(FORM_FIELD_MAX + 1).await.unwrap_err();
+		assert_eq!(refused.status, 413);
 	}
 }

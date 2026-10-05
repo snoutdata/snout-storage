@@ -316,18 +316,15 @@ async fn render(
 			.and_then(|v| v.to_str().ok())
 			.map(str::to_string)
 	};
-	let mime = text("content-type").map(|m| {
-		if m.contains("text/html") {
-			"text/plain".to_string()
-		} else {
-			m
-		}
-	});
+	let served = text("content-type").map(|m| crate::objects::served_type(&m));
 	let mut builder = Response::builder()
 		.status(status)
 		.header("accept-ranges", "bytes");
-	if let Some(mime) = mime {
+	if let Some((mime, active)) = served {
 		builder = builder.header(header::CONTENT_TYPE, mime);
+		if let Some(headers) = builder.headers_mut() {
+			crate::objects::guard_active(headers, active);
+		}
 	}
 	builder = builder.header(header::ETAG, &head.etag).header(
 		"x-robots-tag",
@@ -507,7 +504,7 @@ async fn render_signed(
 				.and_then(Value::as_str)
 				.unwrap_or_default()
 				.to_string();
-			if url != format!("{bucket}/{name}") {
+			if url != format!("{bucket}/{name}") || crate::objects::is_upload_token(&claims) {
 				return Err(StorageError::invalid_signature("Invalid signature"));
 			}
 			let transform = transform_from_string(
