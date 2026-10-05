@@ -840,6 +840,7 @@ async fn authorise(
 		.map_err(|e| StorageError::invalid_jwt(e.0))?;
 		if claims.get("url").and_then(Value::as_str)
 			!= Some(format!("{}/{}", id.bucket, id.object).as_str())
+			|| !crate::objects::is_upload_token(&claims)
 		{
 			return Err(StorageError::invalid_signature("Invalid signature").into());
 		}
