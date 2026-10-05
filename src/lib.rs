@@ -24,7 +24,7 @@ pub mod sigv4;
 pub mod tenants;
 pub mod tus;
 
-/// Entry points for the fuzz targets (`packages/stack/fuzz`): each parser of untrusted input,
+/// Entry points for the fuzz targets: each parser of untrusted input,
 /// called the way a request calls it. Not an API; nothing here is stable.
 #[doc(hidden)]
 pub mod fuzz {
