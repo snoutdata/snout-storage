@@ -102,7 +102,7 @@ fn object_json() -> String {
 	format!(
 		"json_build_object('name', name, 'bucket_id', bucket_id, 'owner', coalesce(owner::text, ''), \
 		 'owner_id', coalesce(owner_id, ''), 'version', coalesce(version, ''), 'id', id, \
-		 'updated_at', {}, 'created_at', {}, 'last_accessed_at', {}, 'metadata', metadata, 'profile_data', profile_data)",
+		 'updated_at', {}, 'created_at', {}, 'last_accessed_at', {}, 'metadata', metadata, 'user_metadata', user_metadata)",
 		iso("updated_at"),
 		iso("created_at"),
 		iso("last_accessed_at")
@@ -181,7 +181,7 @@ pub(crate) async fn find_bucket(
 struct Found {
 	version: Option<String>,
 	metadata: Option<Value>,
-	profile_data: Option<Value>,
+	user_metadata: Option<Value>,
 }
 
 async fn find_object(
@@ -191,7 +191,7 @@ async fn find_object(
 	for_update: bool,
 ) -> Result<Option<Found>, StorageError> {
 	let sql = format!(
-		"SELECT id, version, metadata, profile_data FROM objects WHERE name = $1 AND bucket_id = $2 LIMIT 1{}",
+		"SELECT id, version, metadata, user_metadata FROM objects WHERE name = $1 AND bucket_id = $2 LIMIT 1{}",
 		if for_update { " FOR UPDATE" } else { "" }
 	);
 	Ok(scope
@@ -200,7 +200,7 @@ async fn find_object(
 		.map(|row| Found {
 			version: row.get(1),
 			metadata: row.get(2),
-			profile_data: row.get(3),
+			user_metadata: row.get(3),
 		}))
 }
 
@@ -240,21 +240,21 @@ pub(crate) async fn test_insert(
 	name: &str,
 	upsert: bool,
 	metadata: &Value,
-	profile_data: Option<&Value>,
+	user_metadata: Option<&Value>,
 ) -> Result<(), StorageError> {
 	let (owner, owner_id) = owner_columns(ctx.caller.sub());
 	let scope = ctx.scope(app).await?;
 	let sql = if upsert {
-		"INSERT INTO objects (bucket_id, name, version, owner, owner_id, metadata, profile_data) VALUES ($1, $2, '1', $3, $4, $5, $6) \
-		 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, profile_data = EXCLUDED.profile_data, \
+		"INSERT INTO objects (bucket_id, name, version, owner, owner_id, metadata, user_metadata) VALUES ($1, $2, '1', $3, $4, $5, $6) \
+		 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, user_metadata = EXCLUDED.user_metadata, \
 		 version = EXCLUDED.version, owner = EXCLUDED.owner, owner_id = EXCLUDED.owner_id"
 	} else {
-		"INSERT INTO objects (bucket_id, name, version, owner, owner_id, metadata, profile_data) VALUES ($1, $2, '1', $3, $4, $5, $6)"
+		"INSERT INTO objects (bucket_id, name, version, owner, owner_id, metadata, user_metadata) VALUES ($1, $2, '1', $3, $4, $5, $6)"
 	};
 	let result = scope
 		.execute(
 			sql,
-			&[&bucket, &name, &owner, &owner_id, metadata, &profile_data],
+			&[&bucket, &name, &owner, &owner_id, metadata, &user_metadata],
 		)
 		.await;
 	scope.rollback().await?;
@@ -272,7 +272,7 @@ pub(crate) async fn test_insert(
 pub(crate) struct Incoming {
 	pub(crate) mime: String,
 	pub(crate) cache_control: String,
-	pub(crate) profile_data: Option<Value>,
+	pub(crate) user_metadata: Option<Value>,
 	pub(crate) robots: Option<String>,
 	pub(crate) declared_length: Option<u64>,
 	pub(crate) max_size: u64,
@@ -471,12 +471,12 @@ async fn upload(
 			.map(|t| format!("max-age={t}"))
 			.unwrap_or_else(|| "no-cache".into());
 		check_mime(&mime)?;
-		let profile_data = match text("metadata").or_else(|| text("profileData")) {
+		let user_metadata = match text("metadata").or_else(|| text("userMetadata")) {
 			Some(raw) if raw.len() > 1024 * 1024 => {
 				return Err(StorageError::new(
 					413,
 					"EntityTooLarge",
-					"The profile_data exceeded the maximum allowed size",
+					"The user_metadata exceeded the maximum allowed size",
 				)
 				.with_legacy_name("Payload too large"));
 			}
@@ -486,7 +486,7 @@ async fn upload(
 		incoming = Incoming {
 			mime,
 			cache_control,
-			profile_data,
+			user_metadata,
 			robots,
 			declared_length,
 			max_size,
@@ -511,14 +511,14 @@ async fn upload(
 			.unwrap_or("no-cache")
 			.to_string();
 		check_mime(&mime)?;
-		let profile_data = header_text(&headers, "x-metadata").and_then(parse_user_metadata);
+		let user_metadata = header_text(&headers, "x-metadata").and_then(parse_user_metadata);
 		if declared_length.is_some_and(|length| length > max_size) {
 			return Err(StorageError::entity_too_large());
 		}
 		incoming = Incoming {
 			mime,
 			cache_control,
-			profile_data,
+			user_metadata,
 			robots,
 			declared_length,
 			max_size,
@@ -539,7 +539,7 @@ async fn upload(
 		return Err(error);
 	}
 	let incoming = Incoming {
-		profile_data: Some(incoming.profile_data.clone().unwrap_or_else(|| json!({}))),
+		user_metadata: Some(incoming.user_metadata.clone().unwrap_or_else(|| json!({}))),
 		..incoming
 	};
 	match complete_upload(
@@ -579,7 +579,7 @@ async fn prepare(
 		name,
 		upsert,
 		&metadata,
-		incoming.profile_data.as_ref(),
+		incoming.user_metadata.as_ref(),
 	)
 	.await
 }
@@ -601,11 +601,11 @@ pub(crate) async fn complete_upload(
 	let metadata = head_metadata(&head, incoming.robots.as_deref());
 	// A standard upload always records its user metadata (`{}` when none was sent); a resumable one
 	// without any records none, and an overwrite keeps what the row had, as knex drops `undefined`.
-	let profile_data = incoming.profile_data.clone();
-	let keep = if profile_data.is_none() {
-		"objects.profile_data"
+	let user_metadata = incoming.user_metadata.clone();
+	let keep = if user_metadata.is_none() {
+		"objects.user_metadata"
 	} else {
-		"EXCLUDED.profile_data"
+		"EXCLUDED.user_metadata"
 	};
 	let (owner, owner_id) = owner_columns(owner);
 	let mut scope = ctx.super_scope(app).await?;
@@ -614,11 +614,11 @@ pub(crate) async fn complete_upload(
 	let row = scope
 		.query_opt(
 			&format!(
-				"INSERT INTO objects (name, owner, owner_id, bucket_id, metadata, profile_data, version) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-				 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, profile_data = {keep}, \
+				"INSERT INTO objects (name, owner, owner_id, bucket_id, metadata, user_metadata, version) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+				 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, user_metadata = {keep}, \
 				 version = EXCLUDED.version, owner = EXCLUDED.owner, owner_id = EXCLUDED.owner_id RETURNING id"
 			),
-			&[&name, &owner, &owner_id, &bucket, &metadata, &profile_data, &version],
+			&[&name, &owner, &owner_id, &bucket, &metadata, &user_metadata, &version],
 		)
 		.await?
 		.ok_or_else(StorageError::internal)?;
@@ -1122,7 +1122,7 @@ async fn get_signed_object(
 // ---- head and info ---------------------------------------------------------------------------
 
 const INFO_COLUMNS: &str =
-	"id, name, version, bucket_id, metadata, profile_data, updated_at, created_at";
+	"id, name, version, bucket_id, metadata, user_metadata, updated_at, created_at";
 
 /// The head and info renderers: everything from the row's recorded metadata, nothing from S3.
 async fn describe(
@@ -1178,7 +1178,7 @@ async fn describe(
 			"content_type": mime,
 			"cache_control": cache_control,
 			"etag": etag,
-			"metadata": row.get::<_, Option<Value>>("profile_data"),
+			"metadata": row.get::<_, Option<Value>>("user_metadata"),
 			"last_modified": row.get::<_, Option<String>>("updated_iso"),
 			"created_at": row.get::<_, Option<String>>("created_iso"),
 		});
@@ -1519,7 +1519,7 @@ async fn sign_upload_url(
 ) -> Result<Response, StorageError> {
 	let ctx = context(&app, &method, &uri, &headers, "storage.object.upload_sign").await?;
 	let upsert = header_text(&headers, "x-upsert") == Some("true");
-	let profile_data = header_text(&headers, "x-metadata").and_then(parse_user_metadata);
+	let user_metadata = header_text(&headers, "x-metadata").and_then(parse_user_metadata);
 	let content_length =
 		header_text(&headers, "content-length").and_then(|v| v.trim().parse::<f64>().ok());
 	let metadata = json!({ "mimetype": header_text(&headers, "content-type"), "contentLength": content_length });
@@ -1530,7 +1530,7 @@ async fn sign_upload_url(
 		&name,
 		upsert,
 		&metadata,
-		profile_data.as_ref(),
+		user_metadata.as_ref(),
 	)
 	.await?;
 	let url = format!("{bucket}/{name}");
@@ -1736,8 +1736,8 @@ async fn move_object(
 		let locked = find_object(&scope, &bucket, &source, true).await?.ok_or_else(StorageError::no_such_key)?;
 		scope
 			.execute(
-				"UPDATE objects SET name = $3, bucket_id = $4, version = $5, owner = $6, owner_id = $7, metadata = $8, profile_data = $9 WHERE bucket_id = $1 AND name = $2",
-				&[&bucket, &source, &destination, &destination_bucket, &version, &owner, &owner_id, &metadata, &source_row.profile_data],
+				"UPDATE objects SET name = $3, bucket_id = $4, version = $5, owner = $6, owner_id = $7, metadata = $8, user_metadata = $9 WHERE bucket_id = $1 AND name = $2",
+				&[&bucket, &source, &destination, &destination_bucket, &version, &owner, &owner_id, &metadata, &source_row.user_metadata],
 			)
 			.await?;
 		scope.commit().await?;
@@ -1806,7 +1806,7 @@ async fn copy_object(
 		}
 	}
 	let destination_user_metadata = if copy_metadata {
-		origin.profile_data.clone()
+		origin.user_metadata.clone()
 	} else {
 		header_user_metadata
 	};
@@ -1864,8 +1864,8 @@ async fn copy_object(
 		wait_lock(&mut scope, &destination_bucket, &destination, 3000).await?;
 		let existing = find_object(&scope, &destination_bucket, &destination, true).await?;
 		let sql = format!(
-			"WITH up AS (INSERT INTO objects (bucket_id, name, owner, owner_id, metadata, profile_data, version) VALUES ($1, $2, $3, $4, $5, $6, $7) \
-			 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, profile_data = EXCLUDED.profile_data, \
+			"WITH up AS (INSERT INTO objects (bucket_id, name, owner, owner_id, metadata, user_metadata, version) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+			 ON CONFLICT (name, bucket_id) DO UPDATE SET metadata = EXCLUDED.metadata, user_metadata = EXCLUDED.user_metadata, \
 			 version = EXCLUDED.version, owner = EXCLUDED.owner, owner_id = EXCLUDED.owner_id RETURNING *) \
 			 SELECT {}::text, id FROM up",
 			object_json()
@@ -2040,7 +2040,7 @@ fn list_v1_sql(column: &str, direction: &str) -> String {
 			"WITH m AS ( \
 			   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, lower(o.name) AS lname, \
 			          strpos(substr(lower(o.name), length(lower($2::text)) + 1), '/') AS cut \
-			   FROM snout_files.files o WHERE o.bucket_id = $1 AND starts_with(lower(o.name), lower($2::text)) \
+			   FROM storage.objects o WHERE o.bucket_id = $1 AND starts_with(lower(o.name), lower($2::text)) \
 			 ), listed AS ( \
 			   (SELECT DISTINCT ON (left(lname, length(lower($2::text)) + cut)) \
 			           left(lname, length(lower($2::text)) + cut) AS sort_key, \
@@ -2060,10 +2060,10 @@ fn list_v1_sql(column: &str, direction: &str) -> String {
 			"WITH listed AS ( \
 			   (SELECT 0 AS branch, folder AS folder_name, NULL::timestamptz AS sort_value, folder AS name, NULL::uuid AS id, \
 			           NULL::timestamptz AS updated_at, NULL::timestamptz AS created_at, NULL::timestamptz AS last_accessed_at, NULL::jsonb AS metadata \
-			    FROM (SELECT path_tokens[$3] AS folder FROM snout_files.files \
+			    FROM (SELECT path_tokens[$3] AS folder FROM storage.objects \
 			          WHERE name ILIKE $2::text || '%' AND bucket_id = $1 AND array_length(path_tokens, 1) <> $3 GROUP BY 1) f) \
 			   UNION ALL \
-			   (SELECT 1, NULL, {column}, path_tokens[$3], id, updated_at, created_at, last_accessed_at, metadata FROM snout_files.files \
+			   (SELECT 1, NULL, {column}, path_tokens[$3], id, updated_at, created_at, last_accessed_at, metadata FROM storage.objects \
 			    WHERE name ILIKE $2::text || '%' AND bucket_id = $1 AND array_length(path_tokens, 1) = $3) \
 			 ), page AS ( \
 			   SELECT * FROM listed ORDER BY branch, folder_name {direction}, sort_value {direction} OFFSET $4 LIMIT $5 \
@@ -2098,12 +2098,12 @@ fn list_v2_delimited_sql(by_date: Option<&str>, direction: &str) -> String {
 			format!(
 				"WITH cursor AS ( \
 				   SELECT CASE WHEN $5::text = '' THEN NULL \
-				               WHEN EXISTS (SELECT FROM snout_files.files WHERE bucket_id = $1 AND name COLLATE \"C\" LIKE $5::text || '/%') \
+				               WHEN EXISTS (SELECT FROM storage.objects WHERE bucket_id = $1 AND name COLLATE \"C\" LIKE $5::text || '/%') \
 				               THEN {folder_seek} ELSE {object_seek} END AS seek \
 				 ), m AS ( \
 				   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, \
 				          strpos(substr(o.name, length($2::text) + 1), '/') AS cut \
-				   FROM snout_files.files o, cursor c \
+				   FROM storage.objects o, cursor c \
 				   WHERE o.bucket_id = $1 AND starts_with(o.name, $2::text) \
 				     AND (c.seek IS NULL OR o.name COLLATE \"C\" {compare} c.seek COLLATE \"C\") \
 				 ), listed AS ( \
@@ -2124,7 +2124,7 @@ fn list_v2_delimited_sql(by_date: Option<&str>, direction: &str) -> String {
 				   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, \
 				          CASE WHEN strpos(substr(o.name, length($2::text) + 1), '/') > 0 \
 				               THEN left(o.name, length($2::text) + strpos(substr(o.name, length($2::text) + 1), '/')) END AS folder \
-				   FROM snout_files.files o WHERE o.bucket_id = $1 AND o.name COLLATE \"C\" LIKE $2::text || '%' \
+				   FROM storage.objects o WHERE o.bucket_id = $1 AND o.name COLLATE \"C\" LIKE $2::text || '%' \
 				 ), listed AS ( \
 				   SELECT rtrim(folder, '/') AS name, NULL::uuid AS id, min(created_at) AS updated_at, min(created_at) AS created_at, \
 				          NULL::timestamptz AS last_accessed_at, NULL::jsonb AS metadata \

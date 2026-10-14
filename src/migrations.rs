@@ -60,9 +60,9 @@ impl Default for Roles {
 	fn default() -> Self {
 		Self {
 			install_roles: false,
-			anon: "snout_app".into(),
-			authenticated: "snout_member".into(),
-			service: "snout_server".into(),
+			anon: "anon".into(),
+			authenticated: "authenticated".into(),
+			service: "service_role".into(),
 			super_user: "postgres".into(),
 		}
 	}
@@ -136,13 +136,13 @@ async fn run_locked(
 		// owned by the role that connects, so that role needs no database-wide privilege.
 		let exists: bool = client
 			.query_one(
-				"SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'snout_files')",
+				"SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'storage')",
 				&[],
 			)
 			.await?
 			.get(0);
 		if !exists {
-			client.batch_execute("CREATE SCHEMA snout_files").await?;
+			client.batch_execute("CREATE SCHEMA storage").await?;
 		}
 	}
 	client

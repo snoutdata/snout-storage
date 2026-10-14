@@ -1,5 +1,5 @@
 //! The two HTTP servers: the public one (`/bucket`, `/object`, …, reached through the front door
-//! at `/v1/files`) and the admin one (`/tenants`, the host agent's), on separate ports as
+//! at `/storage/v1`) and the admin one (`/tenants`, the host agent's), on separate ports as
 //! the storage API runs them.
 
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub struct Ctx {
 	pub caller: Caller,
 	pub facts: RequestFacts,
 	/// Whether the request is authenticated: false on the routes that allow a missing or bad
-	/// token (`allowInvalidJwt`), where the caller is then `snout_app`.
+	/// token (`allowInvalidJwt`), where the caller is then `anon`.
 	pub authenticated: bool,
 }
 
@@ -68,12 +68,12 @@ impl Ctx {
 			.await
 	}
 
-	/// The "super user": the tenant's snout_server, for the few checks it makes above
+	/// The "super user": the tenant's service_role, for the few checks it makes above
 	/// the caller (a bucket's emptiness before a delete, its limits before an upload).
 	pub fn service_caller(&self) -> Caller {
-		let mut claims = decode_unverified(&self.tenant.server_key);
-		claims.insert("role".into(), json!("snout_server"));
-		Caller::from_claims(self.tenant.server_key.clone(), claims)
+		let mut claims = decode_unverified(&self.tenant.service_key);
+		claims.insert("role".into(), json!("service_role"));
+		Caller::from_claims(self.tenant.service_key.clone(), claims)
 	}
 }
 
@@ -103,7 +103,7 @@ fn header_map_json(headers: &HeaderMap) -> Map<String, Value> {
 }
 
 /// The tenant from `X-Forwarded-Host`, the caller from `Authorization`, as the storage API's
-/// `tenant-id` and `jwt` plugins do. A bad token is a refusal (403, sent as 400), never `snout_app`.
+/// `tenant-id` and `jwt` plugins do. A bad token is a refusal (403, sent as 400), never `anon`.
 ///
 /// Called after the route's own body and query checks, since Fastify validates those, then the
 /// headers, and only then runs the JWT hook.
@@ -131,7 +131,7 @@ pub async fn context_jwt(
 }
 
 /// The same for a route with `allowInvalidJwt`: no header required, and a missing or bad token
-/// makes the caller `snout_app` rather than a refusal.
+/// makes the caller `anon` rather than a refusal.
 pub async fn context_optional(
 	app: &App,
 	method: &Method,
@@ -216,7 +216,7 @@ async fn caller_context(
 		}),
 		Err(_) if allow_invalid => {
 			let mut claims = Map::new();
-			claims.insert("role".into(), json!("snout_app"));
+			claims.insert("role".into(), json!("anon"));
 			Ok(Ctx {
 				tenant,
 				caller: Caller::from_claims(token, claims),

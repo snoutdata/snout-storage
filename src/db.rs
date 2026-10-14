@@ -1,9 +1,9 @@
 //! The customer's own database, AS THE CALLER. The security core of this server.
 //!
 //! Every object and bucket operation runs in a transaction that first becomes the caller:
-//! `set_config('role', …)` switches to the JWT's Postgres role (`snout_app`, `snout_member`,
-//! `snout_server`), and the JWT's claims land in `request.jwt.claims` (and the settings beside it)
-//! where the customer's row-level security policies read them through `snout_identity.user_id()` and friends.
+//! `set_config('role', …)` switches to the JWT's Postgres role (`anon`, `authenticated`,
+//! `service_role`), and the JWT's claims land in `request.jwt.claims` (and the settings beside it)
+//! where the customer's row-level security policies read them through `auth.uid()` and friends.
 //! **This server never decides who may see or change a row; the database does.** What a policy
 //! refuses comes back as SQLSTATE 42501 and is answered 403, in upstream's words.
 //!
@@ -41,7 +41,7 @@ impl Caller {
 			.get("role")
 			.and_then(Value::as_str)
 			.filter(|r| !r.is_empty())
-			.unwrap_or("snout_app")
+			.unwrap_or("anon")
 			.to_string();
 		Self { role, jwt, claims }
 	}

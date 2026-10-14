@@ -228,7 +228,7 @@ mod tests {
 
 	fn claims(extra: Value) -> Map<String, Value> {
 		let mut map = Map::new();
-		map.insert("role".into(), json!("snout_member"));
+		map.insert("role".into(), json!("authenticated"));
 		if let Value::Object(more) = extra {
 			map.extend(more);
 		}
@@ -253,12 +253,12 @@ mod tests {
 	#[test]
 	fn reads_a_token_shaped_like_the_projects_keys() {
 		let head = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
-		let body = URL_SAFE_NO_PAD.encode(r#"{"role":"snout_app","iss":"auth"}"#);
+		let body = URL_SAFE_NO_PAD.encode(r#"{"role":"anon","iss":"auth"}"#);
 		let signed = format!("{head}.{body}");
 		let signature = URL_SAFE_NO_PAD
 			.encode(mac("HS256", SECRET.as_bytes(), signed.as_bytes()).unwrap_or_default());
 		let payload = verify(&format!("{signed}.{signature}"), SECRET, &[]).unwrap_or_default();
-		assert_eq!(payload.get("role"), Some(&json!("snout_app")));
+		assert_eq!(payload.get("role"), Some(&json!("anon")));
 	}
 
 	#[test]

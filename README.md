@@ -6,7 +6,7 @@ who may read, write or delete what**. One static binary, written in Rust. It run
 on a SnoutData Cloud host.
 
 - **Your policies decide.** Every file operation runs in the project's own database as the
-  caller, against `snout_files.files` and `snout_files.spaces`, so an ordinary Postgres policy is the
+  caller, against `storage.objects` and `storage.buckets`, so an ordinary Postgres policy is the
   whole of the access control. The server never decides access itself.
 - **Everything a file API needs:** buckets (public or private, per-bucket size and type limits),
   upload (binary, multipart form, or streamed), upsert, download with byte ranges and caching
@@ -21,14 +21,14 @@ on a SnoutData Cloud host.
 ## The schema
 
 `migrations/tenant/` creates the `storage` schema in each project's database: `buckets`,
-`objects`, and a few helpers for policies (`snout_files.foldername(name)`, `snout_files.filename(name)`,
-`snout_files.extension(name)`, `snout_files.operation()`). A policy that lets each user manage the files
+`objects`, and a few helpers for policies (`storage.foldername(name)`, `storage.filename(name)`,
+`storage.extension(name)`, `storage.operation()`). A policy that lets each user manage the files
 under a folder named after them:
 
 ```sql
-create policy "own files" on snout_files.files for all to snout_member
-	using (bucket_id = 'avatars' and (snout_files.foldername(name))[1] = snout_identity.user_id()::text)
-	with check (bucket_id = 'avatars' and (snout_files.foldername(name))[1] = snout_identity.user_id()::text);
+create policy "own files" on storage.objects for all to authenticated
+	using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text)
+	with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 ```
 
 `migrations/metadata/` creates the `tenants` table in the server's own metadata database. Each
@@ -62,7 +62,7 @@ authorised by `apikey: <SERVER_ADMIN_API_KEYS>`). The tenant is the first group 
 | `STORAGE_S3_UPLOAD_PART_SIZE`, `STORAGE_S3_UPLOAD_QUEUE_SIZE` | 16 MiB, 2 | streamed upload parts and how many are in flight |
 | `UPLOAD_FILE_SIZE_LIMIT` | 50 MiB | the largest upload, before any tenant or bucket limit |
 | `IMGPROXY_URL` | | enables image resizing |
-| `DB_ANON_ROLE`, `DB_AUTHENTICATED_ROLE`, `DB_SERVICE_ROLE` | snout_app, snout_member, snout_server | the roles a caller becomes |
+| `DB_ANON_ROLE`, `DB_AUTHENTICATED_ROLE`, `DB_SERVICE_ROLE` | anon, authenticated, service_role | the roles a caller becomes |
 | `DB_INSTALL_ROLES` | false | create those roles when missing |
 | `DATABASE_MAX_CONNECTIONS`, `DATABASE_STATEMENT_TIMEOUT` | 20, 30000 ms | per tenant |
 | `SERVER_PORT`, `SERVER_ADMIN_PORT` | 5000, 5001 | |

@@ -864,7 +864,7 @@ async fn authorise(
 	let Some(declared) = declared else {
 		return Ok(());
 	};
-	let profile_data: Option<Value> = declared
+	let user_metadata: Option<Value> = declared
 		.raw_metadata
 		.and_then(|r| serde_json::from_str(&r).ok());
 	let row_metadata =
@@ -876,7 +876,7 @@ async fn authorise(
 		&id.object,
 		uploader.upsert,
 		&row_metadata,
-		profile_data.as_ref(),
+		user_metadata.as_ref(),
 	)
 	.await?;
 	Ok(())
@@ -889,14 +889,14 @@ async fn finish(
 	id: &UploadId,
 	info_metadata: Option<&Map<String, Value>>,
 ) -> Result<(), TusError> {
-	let profile_data = info_metadata
+	let user_metadata = info_metadata
 		.and_then(|m| m.get("metadata"))
 		.and_then(Value::as_str)
 		.and_then(|r| serde_json::from_str::<Value>(r).ok());
 	let incoming = Incoming {
 		mime: String::new(),
 		cache_control: String::new(),
-		profile_data,
+		user_metadata,
 		robots: None,
 		declared_length: None,
 		max_size: 0,

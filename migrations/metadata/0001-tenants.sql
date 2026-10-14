@@ -5,8 +5,8 @@
 
 CREATE TABLE tenants (
 	id text PRIMARY KEY,
-	app_key text NOT NULL,
-	server_key text NOT NULL,
+	anon_key text NOT NULL,
+	service_key text NOT NULL,
 	jwt_secret text NOT NULL,
 	database_url text NOT NULL,
 	file_size_limit bigint NOT NULL DEFAULT 52428800,

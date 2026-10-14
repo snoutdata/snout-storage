@@ -28,8 +28,8 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone)]
 pub struct Tenant {
 	pub id: String,
-	pub app_key: String,
-	pub server_key: String,
+	pub anon_key: String,
+	pub service_key: String,
 	pub jwt_secret: String,
 	pub database_url: String,
 	pub file_size_limit: u64,
@@ -55,8 +55,8 @@ impl Tenant {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantBody {
-	pub app_key: String,
-	pub server_key: String,
+	pub anon_key: String,
+	pub service_key: String,
 	pub jwt_secret: String,
 	pub database_url: String,
 	pub file_size_limit: Option<u64>,
@@ -138,7 +138,7 @@ impl Registry {
 		let client = self.pool.get().await.map_err(db_error)?;
 		let row = client
 			.query_opt(
-				"SELECT app_key, server_key, jwt_secret, database_url, file_size_limit, feature_image_transformation, image_transformation_max_resolution FROM tenants WHERE id = $1",
+				"SELECT anon_key, service_key, jwt_secret, database_url, file_size_limit, feature_image_transformation, image_transformation_max_resolution FROM tenants WHERE id = $1",
 				&[&id],
 			)
 			.await
@@ -162,8 +162,8 @@ impl Registry {
 		}
 		let tenant = Arc::new(Tenant {
 			id: id.to_string(),
-			app_key: self.decrypt(row.get(0))?,
-			server_key: self.decrypt(row.get(1))?,
+			anon_key: self.decrypt(row.get(0))?,
+			service_key: self.decrypt(row.get(1))?,
 			jwt_secret: self.decrypt(row.get(2))?,
 			database_url: self.decrypt(row.get(3))?,
 			file_size_limit: row.get::<_, i64>(4).max(0) as u64,
@@ -191,18 +191,18 @@ impl Registry {
 			.and_then(|t| t.enabled);
 		transaction
 			.execute(
-				"INSERT INTO tenants (id, app_key, database_url, jwt_secret, server_key, file_size_limit, feature_image_transformation) \
+				"INSERT INTO tenants (id, anon_key, database_url, jwt_secret, service_key, file_size_limit, feature_image_transformation) \
 				 VALUES ($1, $2, $3, $4, $5, COALESCE($6::bigint, 52428800), COALESCE($7::boolean, false)) \
-				 ON CONFLICT (id) DO UPDATE SET app_key = EXCLUDED.app_key, database_url = EXCLUDED.database_url, \
-				 jwt_secret = EXCLUDED.jwt_secret, server_key = EXCLUDED.server_key, \
+				 ON CONFLICT (id) DO UPDATE SET anon_key = EXCLUDED.anon_key, database_url = EXCLUDED.database_url, \
+				 jwt_secret = EXCLUDED.jwt_secret, service_key = EXCLUDED.service_key, \
 				 file_size_limit = COALESCE($6::bigint, tenants.file_size_limit), \
 				 feature_image_transformation = COALESCE($7::boolean, tenants.feature_image_transformation)",
 				&[
 					&id,
-					&crypto::encrypt(&self.key, &body.app_key),
+					&crypto::encrypt(&self.key, &body.anon_key),
 					&crypto::encrypt(&self.key, &body.database_url),
 					&crypto::encrypt(&self.key, &body.jwt_secret),
-					&crypto::encrypt(&self.key, &body.server_key),
+					&crypto::encrypt(&self.key, &body.service_key),
 					&body.file_size_limit.map(|limit| limit as i64),
 					&image,
 				],

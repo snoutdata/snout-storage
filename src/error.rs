@@ -200,7 +200,7 @@ impl StorageError {
 	pub fn database(message: impl Into<String>) -> Self {
 		Self::new(500, "DatabaseError", message)
 	}
-	/// `/v1/files/s3` (the S3-protocol endpoint) is not served.
+	/// `/storage/v1/s3` (the S3-protocol endpoint) is not served.
 	pub fn s3_protocol_not_supported() -> Self {
 		Self::new(
 			404,

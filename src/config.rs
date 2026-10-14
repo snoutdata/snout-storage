@@ -26,7 +26,7 @@ pub struct Config {
 	pub install_roles: bool,
 	pub anon_role: String,
 	pub authenticated_role: String,
-	pub snout_server: String,
+	pub service_role: String,
 	pub super_user: String,
 	/// `DATABASE_STATEMENT_TIMEOUT`, milliseconds.
 	pub statement_timeout_ms: u64,
@@ -154,10 +154,10 @@ impl Config {
 					== Some("0"),
 			},
 			install_roles: first(env, &["DB_INSTALL_ROLES"]).as_deref() == Some("true"),
-			anon_role: first(env, &["DB_ANON_ROLE"]).unwrap_or_else(|| "snout_app".into()),
+			anon_role: first(env, &["DB_ANON_ROLE"]).unwrap_or_else(|| "anon".into()),
 			authenticated_role: first(env, &["DB_AUTHENTICATED_ROLE"])
-				.unwrap_or_else(|| "snout_member".into()),
-			snout_server: first(env, &["DB_SERVICE_ROLE"]).unwrap_or_else(|| "snout_server".into()),
+				.unwrap_or_else(|| "authenticated".into()),
+			service_role: first(env, &["DB_SERVICE_ROLE"]).unwrap_or_else(|| "service_role".into()),
 			super_user: first(env, &["DB_SUPER_USER"]).unwrap_or_else(|| "postgres".into()),
 			statement_timeout_ms: number(env, &["DATABASE_STATEMENT_TIMEOUT"], 30_000)?,
 			max_connections: number(env, &["DATABASE_MAX_CONNECTIONS"], 20)?,
