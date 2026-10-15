@@ -690,11 +690,22 @@ fn id_from(uri: &axum::http::Uri, ctx: &Ctx, tus_path: &str) -> Option<String> {
 	))
 }
 
+/// The upload path a request came in on: the new one (`/upload/resume`, OWN-LAYOUT 2e) when it
+/// asked there, else the configured one, so a `Location` answers in the vocabulary it was asked in.
+pub(crate) fn tus_path_of<'a>(configured: &'a str, request_path: &str) -> &'a str {
+	let new = crate::app::TUS_NEW_PATH;
+	if request_path == new || request_path.starts_with(&format!("{new}/")) {
+		new
+	} else {
+		configured.trim_end_matches('/')
+	}
+}
+
 /// `generateUrl`: the forwarded scheme, host and port (or `STORAGE_PUBLIC_URL`'s), the path (under
 /// `X-Forwarded-Prefix` when allowed), `/sign` kept, the id base64url.
 fn location(app: &App, headers: &HeaderMap, uri: &axum::http::Uri, id: &str) -> String {
 	use base64::Engine;
-	let path = app.config.tus_path.trim_end_matches('/');
+	let path = tus_path_of(&app.config.tus_path, uri.path());
 	let mut host = String::new();
 	let forwarded_proto = header_text(headers, "forwarded")
 		.and_then(|f| {
@@ -1306,6 +1317,26 @@ async fn terminate(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn a_location_answers_in_the_vocabulary_it_was_asked_in() {
+		assert_eq!(
+			tus_path_of("/upload/resumable", "/upload/resume"),
+			"/upload/resume"
+		);
+		assert_eq!(
+			tus_path_of("/upload/resumable", "/upload/resume/sign/abc"),
+			"/upload/resume"
+		);
+		assert_eq!(
+			tus_path_of("/upload/resumable/", "/upload/resumable/abc"),
+			"/upload/resumable"
+		);
+		assert_eq!(
+			tus_path_of("/upload/resumable", "/upload/resumes"),
+			"/upload/resumable"
+		);
+	}
 
 	#[test]
 	fn metadata_parses_as_tus_does() {

@@ -5,23 +5,57 @@
 //! each file's SHA-256, so a file edited after it ran is an error that names it, never a quiet
 //! divergence between databases. `.gitattributes` keeps a checkout from rewriting the bytes.
 //!
+//! **The files are written in the own layout's names** (`snout_files`, `spaces`, `files`, the
+//! `snout_*` roles), and a database still in the old layout is given them in its own names by
+//! `layout::sql_from_new`, statement for statement what it was given before.
+//!
 //! The whole run holds an advisory lock, so two servers starting at once never migrate one
 //! database twice.
 
+use std::borrow::Cow;
+
 use sha2::{Digest, Sha256};
 use tokio_postgres::Client;
+
+use crate::layout;
 
 pub struct Migration {
 	pub id: i32,
 	pub name: &'static str,
 	pub sql: &'static str,
+	/// The hashes this file had when an earlier release applied it: the same statements, before
+	/// the file was written in the own layout's names (2026-10-14). Still accepted, so a database
+	/// migrated then, in either layout, is neither refused nor migrated again.
+	pub released_as: &'static [&'static str],
 }
 
 impl Migration {
+	/// The file's hash, which is what the ledger records in either layout: a database renamed in
+	/// place keeps the ledger it had.
 	pub fn hash(&self) -> String {
 		hex::encode(Sha256::digest(self.sql.as_bytes()))
 	}
+
+	/// Whether a ledger row's hash is this migration: today's file, or the file as released before.
+	pub fn accepts(&self, hash: &str) -> bool {
+		hash == self.hash() || self.released_as.contains(&hash)
+	}
+
+	/// The statements to run: the file as written in a new-layout database, and in an old-layout
+	/// one with its names spelled back (`snout_files` -> `storage`, `spaces` -> `buckets`, `files`
+	/// -> `objects`, the role names its fallbacks name). Role names arrive through settings, mapped
+	/// by the runner.
+	pub fn sql_for(&self, new: bool) -> Cow<'static, str> {
+		layout::sql_from_new(self.sql, new, MIGRATIONS)
+	}
 }
+
+/// What a migration file is spelled back for: as the server's statements, and the role names its
+/// settings fall back to (`coalesce(..., 'snout_app')`).
+const MIGRATIONS: layout::Rewrite<'static> = layout::Rewrite {
+	bare: &["storage"],
+	roles: true,
+};
 
 /// Which database a set of migrations is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,13 +67,20 @@ pub enum Target {
 }
 
 impl Target {
-	fn schema(self) -> &'static str {
+	fn schema(self, new: bool) -> &'static str {
 		match self {
+			Target::Tenant if new => "snout_files",
 			Target::Tenant => "storage",
 			Target::Metadata => "public",
 		}
 	}
 }
+
+/// Whether a project's database is in the new layout (OWN-LAYOUT 2b), asked before anything is
+/// made: it has `snout_files`, or it has neither schema yet and has the new role names (a database
+/// made in the new layout, whose storage schema this runner is about to make).
+const NEW_LAYOUT_SQL: &str = "SELECT to_regnamespace('snout_files') IS NOT NULL \
+	OR (to_regnamespace('storage') IS NULL AND to_regrole('snout_member') IS NOT NULL)";
 
 /// "snout-st", so it collides with no other advisory lock by accident.
 const LOCK_KEY: i64 = 0x736e_6f75_742d_7374;
@@ -103,8 +144,17 @@ pub async fn migrate(
 	target: Target,
 	roles: &Roles,
 ) -> Result<Vec<i32>, MigrationError> {
+	let new = target == Target::Tenant
+		&& client
+			.query_one(NEW_LAYOUT_SQL, &[])
+			.await?
+			.get::<_, bool>(0);
 	client
-		.batch_execute(&format!("SET search_path TO {SEARCH_PATH}"))
+		.batch_execute(&layout::sql_in_layout(
+			&format!("SET search_path TO {SEARCH_PATH}"),
+			new,
+			layout::Rewrite::default(),
+		))
 		.await?;
 	loop {
 		let row = client
@@ -115,7 +165,7 @@ pub async fn migrate(
 		}
 		tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 	}
-	let outcome = run_locked(client, migrations, target, roles).await;
+	let outcome = run_locked(client, migrations, target, roles, new).await;
 	// Released whatever happened; a failed unlock on a dying connection releases with it.
 	let _ = client
 		.execute("SELECT pg_advisory_unlock($1)", &[&LOCK_KEY])
@@ -128,21 +178,24 @@ async fn run_locked(
 	migrations: &[Migration],
 	target: Target,
 	roles: &Roles,
+	new: bool,
 ) -> Result<Vec<i32>, MigrationError> {
-	let schema = target.schema();
+	let schema = target.schema(new);
 	if target == Target::Tenant {
 		// Looked up first: `CREATE SCHEMA IF NOT EXISTS` checks CREATE on the database before it
 		// checks existence, and a database prepared for this server makes the schema in advance,
 		// owned by the role that connects, so that role needs no database-wide privilege.
 		let exists: bool = client
 			.query_one(
-				"SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = 'storage')",
-				&[],
+				"SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = $1)",
+				&[&schema],
 			)
 			.await?
 			.get(0);
 		if !exists {
-			client.batch_execute("CREATE SCHEMA storage").await?;
+			client
+				.batch_execute(&format!("CREATE SCHEMA {schema}"))
+				.await?;
 		}
 	}
 	client
@@ -166,7 +219,7 @@ async fn run_locked(
 	for migration in migrations {
 		if let Some((id, name, hash)) = applied.iter().find(|(id, _, _)| *id == migration.id) {
 			let expected = migration.hash();
-			if *hash != expected || name != migration.name {
+			if !migration.accepts(hash) || name != migration.name {
 				return Err(MigrationError::Mismatch {
 					id: *id,
 					name: migration.name.to_string(),
@@ -185,16 +238,19 @@ async fn run_locked(
 	if pending.is_empty() {
 		return Ok(Vec::new());
 	}
-	// What the migrations read to name roles (session-wide, for this connection only).
+	// What the migrations read to name roles (session-wide, for this connection only), as this
+	// database names them: the new names in a new-layout database, where grants go to them and
+	// never to the old names it keeps as aliases. A role of the operator's own is passed as it is.
+	let role = |name: &str| layout::role_in_database(name, new).to_string();
 	client
 		.batch_execute(&format!(
 			"SELECT set_config('storage.install_roles', {}, false), set_config('storage.anon_role', {}, false), \
 			 set_config('storage.authenticated_role', {}, false), set_config('storage.service_role', {}, false), \
 			 set_config('storage.super_user', {}, false)",
 			literal(if roles.install_roles { "true" } else { "false" }),
-			literal(&roles.anon),
-			literal(&roles.authenticated),
-			literal(&roles.service),
+			literal(&role(&roles.anon)),
+			literal(&role(&roles.authenticated)),
+			literal(&role(&roles.service)),
 			literal(&roles.super_user),
 		))
 		.await?;
@@ -203,7 +259,10 @@ async fn run_locked(
 	for migration in pending {
 		let result: Result<(), tokio_postgres::Error> = async {
 			client.batch_execute("START TRANSACTION").await?;
-			client.batch_execute(migration.sql).await?;
+			// The metadata database has no layout: its file runs as written.
+			client
+				.batch_execute(&migration.sql_for(new || target == Target::Metadata))
+				.await?;
 			client
 				.execute(
 					&format!(
@@ -242,6 +301,74 @@ mod tests {
 			assert!(!list.is_empty());
 			assert!(list.windows(2).all(|w| w[0].id < w[1].id));
 		}
+	}
+
+	#[test]
+	fn the_files_are_written_in_the_new_names() {
+		for m in TENANT.iter().chain(METADATA) {
+			assert!(matches!(m.sql_for(true), std::borrow::Cow::Borrowed(_)));
+		}
+		let file = TENANT[0].sql;
+		for made in [
+			"CREATE TABLE snout_files.spaces (",
+			"CREATE TABLE snout_files.files (",
+			"bucket_id text REFERENCES snout_files.spaces (id)",
+			"CREATE TRIGGER objects_guard_delete BEFORE DELETE ON snout_files.files",
+			"FROM snout_files.files o GROUP BY o.bucket_id",
+			"ALTER TABLE snout_files.migrations ENABLE ROW LEVEL SECURITY",
+			"GRANT USAGE ON SCHEMA snout_files TO %I, %I, %I",
+			"GRANT ALL ON snout_files.spaces, snout_files.files TO %I, %I, %I",
+			"current_setting('storage.anon_role', true), ''), 'snout_app')",
+			"current_setting('storage.operation', true)",
+			"current_setting('storage.allow_delete_query', true)",
+		] {
+			assert!(file.contains(made), "{made}");
+		}
+	}
+
+	#[test]
+	fn an_old_database_is_given_the_file_in_its_names() {
+		let file = TENANT[0].sql;
+		let old = TENANT[0].sql_for(false);
+		for made in [
+			"CREATE TABLE storage.buckets (",
+			"CREATE TABLE storage.objects (",
+			"bucket_id text REFERENCES storage.buckets (id)",
+			"GRANT ALL ON storage.buckets, storage.objects TO %I, %I, %I",
+			"current_setting('storage.anon_role', true), ''), 'anon')",
+			"current_setting('storage.operation', true)",
+		] {
+			assert!(old.contains(made), "{made}");
+		}
+		// Exactly the file again when spelled over: nothing is lost on the way back.
+		assert_eq!(
+			crate::layout::sql_in_layout(&old, true, super::MIGRATIONS),
+			file
+		);
+		// The metadata database's file has no layout names to spell.
+		assert!(matches!(
+			METADATA[0].sql_for(false),
+			std::borrow::Cow::Borrowed(_)
+		));
+	}
+
+	#[test]
+	fn a_released_hash_is_still_accepted() {
+		let first = &TENANT[0];
+		assert_eq!(first.hash(), {
+			use sha2::{Digest, Sha256};
+			hex::encode(Sha256::digest(first.sql.as_bytes()))
+		});
+		assert!(first.accepts(&first.hash()));
+		// What every release before the own layout's names recorded.
+		assert!(first.accepts("1f8f5dfe5eaa9f6abc7363664ab28f9151d32a459732e828afbd7ec21c2ac14f"));
+		assert!(!first.accepts(&"0".repeat(64)));
+		assert!(
+			TENANT
+				.iter()
+				.chain(METADATA)
+				.all(|m| !m.released_as.contains(&m.hash().as_str()))
+		);
 	}
 
 	#[test]

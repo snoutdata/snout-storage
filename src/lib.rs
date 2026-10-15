@@ -14,6 +14,7 @@ pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod jwt;
+pub mod layout;
 pub mod limits;
 pub mod migration_files;
 pub mod migrations;

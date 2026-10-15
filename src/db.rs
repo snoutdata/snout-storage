@@ -15,6 +15,7 @@
 //! the storage admin role, to that project's database only), so the credential this shared
 //! process holds for one tenant opens that tenant's database and nothing else on the host.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -25,6 +26,7 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::ToSql;
 
 use crate::error::StorageError;
+use crate::layout;
 use crate::migrations::SEARCH_PATH;
 
 /// Who is asking, as the verified JWT says.
@@ -110,9 +112,76 @@ pub fn map_pg_error(error: &tokio_postgres::Error) -> StorageError {
 	}
 }
 
+/// Which names a tenant's database has, asked once when its pool is made (OWN-LAYOUT section 3,
+/// item 6): one server serves renamed and unrenamed projects at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantLayout {
+	/// The new role names exist (`snout_member` ...), so a claim in either vocabulary is run as
+	/// the new one; otherwise as the old.
+	pub has_new_roles: bool,
+	/// `snout_files` when the database has it, else `storage`.
+	pub schema: String,
+	/// `snout_ext` when the database has it, else `extensions`.
+	pub extensions: String,
+}
+
+impl Default for TenantLayout {
+	fn default() -> Self {
+		Self {
+			has_new_roles: false,
+			schema: "storage".into(),
+			extensions: "extensions".into(),
+		}
+	}
+}
+
+impl TenantLayout {
+	/// The new layout (OWN-LAYOUT 2b): the schema is `snout_files`, and with it the tables are
+	/// `spaces` and `files`. A database has all of the old names or all of the new.
+	pub fn is_new(&self) -> bool {
+		self.schema == "snout_files"
+	}
+
+	/// A statement written with the old names (`objects`, `buckets`, unqualified on the search
+	/// path, or `storage.`), in this database's names. Unchanged in an old-layout database.
+	pub fn sql<'a>(&self, text: &'a str) -> Cow<'a, str> {
+		layout::sql_in_layout(text, self.is_new(), STATEMENTS)
+	}
+
+	/// The connection's search path: `SEARCH_PATH` with the resolved names.
+	pub fn search_path(&self) -> String {
+		SEARCH_PATH
+			.split(',')
+			.map(str::trim)
+			.map(|name| match name {
+				"storage" => self.schema.as_str(),
+				"extensions" => self.extensions.as_str(),
+				other => other,
+			})
+			.collect::<Vec<_>>()
+			.join(",")
+	}
+}
+
+/// What a statement of this server is rewritten for: the storage tables by their bare names too,
+/// since the search path finds them; never role names, which only ever arrive as parameters.
+pub const STATEMENTS: layout::Rewrite<'static> = layout::Rewrite {
+	bare: &["storage"],
+	roles: false,
+};
+
+/// The one statement that resolves a `TenantLayout`. The schema is the signal (a database has
+/// all of the old names or all of the new): roles are the cluster's, so a role that exists says
+/// nothing about this database unless its schema is the new one too.
+const LAYOUT_SQL: &str = "select to_regnamespace('snout_files') is not null and to_regrole('snout_member') is not null, \
+	case when to_regnamespace('snout_files') is not null then 'snout_files' else 'storage' end, \
+	case when to_regnamespace('snout_ext') is not null then 'snout_ext' else 'extensions' end";
+
+type TenantPool = (String, Pool, Arc<TenantLayout>);
+
 #[derive(Default)]
 pub struct Pools {
-	pools: RwLock<HashMap<String, (String, Pool)>>,
+	pools: RwLock<HashMap<String, TenantPool>>,
 	max_connections: usize,
 	statement_timeout_ms: u64,
 }
@@ -126,18 +195,59 @@ impl Pools {
 		}
 	}
 
-	async fn pool(&self, tenant: &str, database_url: &str) -> Result<Pool, StorageError> {
-		if let Some((url, pool)) = self.pools.read().await.get(tenant)
+	async fn pool(
+		&self,
+		tenant: &str,
+		database_url: &str,
+	) -> Result<(Pool, Arc<TenantLayout>), StorageError> {
+		if let Some((url, pool, layout)) = self.pools.read().await.get(tenant)
 			&& url == database_url
 		{
-			return Ok(pool.clone());
+			return Ok((pool.clone(), layout.clone()));
 		}
-		let mut config: tokio_postgres::Config = database_url.parse().map_err(|error| {
+		let config: tokio_postgres::Config = database_url.parse().map_err(|error| {
 			tracing::error!(tenant, %error, "tenant database_url");
 			StorageError::internal()
 		})?;
+		// Built with the old names first, asked which names it has, and built again only when it
+		// has the new ones: the search path is a connection option, set before any connection.
+		let old = TenantLayout::default();
+		let mut pool = self.build(tenant, config.clone(), &old)?;
+		let layout = {
+			let client = pool.get().await.map_err(|error| {
+				tracing::error!(tenant, %error, "tenant connection");
+				StorageError::database_timeout()
+			})?;
+			let row = client
+				.query_one(LAYOUT_SQL, &[])
+				.await
+				.map_err(|e| map_pg_error(&e))?;
+			TenantLayout {
+				has_new_roles: row.get(0),
+				schema: row.get(1),
+				extensions: row.get(2),
+			}
+		};
+		if layout.search_path() != old.search_path() {
+			pool.close();
+			pool = self.build(tenant, config, &layout)?;
+		}
+		let layout = Arc::new(layout);
+		self.pools.write().await.insert(
+			tenant.to_string(),
+			(database_url.to_string(), pool.clone(), layout.clone()),
+		);
+		Ok((pool, layout))
+	}
+
+	fn build(
+		&self,
+		tenant: &str,
+		mut config: tokio_postgres::Config,
+		layout: &TenantLayout,
+	) -> Result<Pool, StorageError> {
 		// The search path, on the connection.
-		config.options(format!("-c search_path={}", SEARCH_PATH.replace(' ', "")));
+		config.options(format!("-c search_path={}", layout.search_path()));
 		let manager = Manager::from_config(
 			config,
 			NoTls,
@@ -145,24 +255,19 @@ impl Pools {
 				recycling_method: RecyclingMethod::Fast,
 			},
 		);
-		let pool = Pool::builder(manager)
+		Pool::builder(manager)
 			.max_size(self.max_connections.max(1))
 			.runtime(Runtime::Tokio1)
 			.build()
 			.map_err(|error| {
 				tracing::error!(tenant, %error, "tenant pool");
 				StorageError::internal()
-			})?;
-		self.pools
-			.write()
-			.await
-			.insert(tenant.to_string(), (database_url.to_string(), pool.clone()));
-		Ok(pool)
+			})
 	}
 
 	/// Drops a tenant's connections: its credentials changed or it left the host.
 	pub async fn forget(&self, tenant: &str) {
-		if let Some((_, pool)) = self.pools.write().await.remove(tenant) {
+		if let Some((_, pool, _)) = self.pools.write().await.remove(tenant) {
 			pool.close();
 		}
 	}
@@ -175,7 +280,7 @@ impl Pools {
 		caller: &Caller,
 		facts: &RequestFacts,
 	) -> Result<Scope, StorageError> {
-		let pool = self.pool(tenant, database_url).await?;
+		let (pool, layout) = self.pool(tenant, database_url).await?;
 		let client = pool.get().await.map_err(|error| {
 			tracing::error!(tenant, %error, "tenant connection");
 			StorageError::database_timeout()
@@ -183,6 +288,7 @@ impl Pools {
 		let mut scope = Scope {
 			client: Some(client),
 			open: false,
+			layout,
 		};
 		scope.execute_batch("BEGIN").await?;
 		scope.open = true;
@@ -205,9 +311,16 @@ impl Pools {
 pub struct Scope {
 	client: Option<Object>,
 	open: bool,
+	layout: Arc<TenantLayout>,
 }
 
 impl Scope {
+	/// The storage schema's name in this database (`snout_files` or `storage`), for a statement
+	/// that names it.
+	pub fn schema(&self) -> &str {
+		&self.layout.schema
+	}
+
 	fn client(&self) -> Result<&Object, StorageError> {
 		self.client.as_ref().ok_or_else(StorageError::internal)
 	}
@@ -219,7 +332,15 @@ impl Scope {
 		caller: &Caller,
 		facts: &RequestFacts,
 	) -> Result<(), StorageError> {
-		let claims = Value::Object(caller.claims.clone()).to_string();
+		// The role the claim names, as the data API runs it (`layout::role_to_run`): an old name
+		// as the alias role it is where the new names exist, a new name as the old one where they
+		// do not. In the role, the role claim and the claims alike, so a policy sees one name.
+		let role = layout::role_to_run(&caller.role, self.layout.has_new_roles).to_string();
+		let mut claims = caller.claims.clone();
+		if claims.get("role").and_then(Value::as_str) == Some(caller.role.as_str()) {
+			claims.insert("role".into(), Value::String(role.clone()));
+		}
+		let claims = Value::Object(claims).to_string();
 		let headers = Value::Object(facts.headers.clone()).to_string();
 		let sub = caller.sub().unwrap_or("").to_string();
 		self.query(
@@ -227,15 +348,18 @@ impl Scope {
 			 set_config('request.jwt.claim.sub', $4, true), set_config('request.jwt.claims', $5, true), set_config('request.headers', $6, true), \
 			 set_config('request.method', $7, true), set_config('request.path', $8, true), set_config('storage.operation', $9, true), \
 			 set_config('storage.allow_delete_query', 'true', true)",
-			&[&caller.role, &caller.role, &caller.jwt, &sub, &claims, &headers, &facts.method, &facts.path, &facts.operation],
+			&[&role, &role, &caller.jwt, &sub, &claims, &headers, &facts.method, &facts.path, &facts.operation],
 		)
 		.await?;
 		Ok(())
 	}
 
+	// Every statement goes through one of the four below, which is where it is put in this
+	// database's names (`TenantLayout::sql`).
+
 	pub async fn execute_batch(&mut self, sql: &str) -> Result<(), StorageError> {
 		self.client()?
-			.batch_execute(sql)
+			.batch_execute(&self.layout.sql(sql))
 			.await
 			.map_err(|e| map_pg_error(&e))
 	}
@@ -246,7 +370,7 @@ impl Scope {
 		params: &[&(dyn ToSql + Sync)],
 	) -> Result<Vec<tokio_postgres::Row>, StorageError> {
 		self.client()?
-			.query(sql, params)
+			.query(&*self.layout.sql(sql), params)
 			.await
 			.map_err(|e| map_pg_error(&e))
 	}
@@ -257,7 +381,7 @@ impl Scope {
 		params: &[&(dyn ToSql + Sync)],
 	) -> Result<Option<tokio_postgres::Row>, StorageError> {
 		self.client()?
-			.query_opt(sql, params)
+			.query_opt(&*self.layout.sql(sql), params)
 			.await
 			.map_err(|e| map_pg_error(&e))
 	}
@@ -268,7 +392,7 @@ impl Scope {
 		params: &[&(dyn ToSql + Sync)],
 	) -> Result<u64, StorageError> {
 		self.client()?
-			.execute(sql, params)
+			.execute(&*self.layout.sql(sql), params)
 			.await
 			.map_err(|e| map_pg_error(&e))
 	}
@@ -299,3 +423,48 @@ impl Drop for Scope {
 
 /// Shared by every route.
 pub type SharedPools = Arc<Pools>;
+
+#[cfg(test)]
+mod tests {
+	use super::TenantLayout;
+
+	#[test]
+	fn the_search_path_takes_the_names_the_database_has() {
+		assert_eq!(
+			TenantLayout::default().search_path(),
+			"storage,public,extensions"
+		);
+		let renamed = TenantLayout {
+			has_new_roles: true,
+			schema: "snout_files".into(),
+			extensions: "snout_ext".into(),
+		};
+		assert_eq!(renamed.search_path(), "snout_files,public,snout_ext");
+	}
+
+	#[test]
+	fn statements_take_the_names_the_database_has() {
+		let sql = "INSERT INTO objects (bucket_id, name) VALUES ($1, $2) ON CONFLICT (bucket_id, name) \
+			DO UPDATE SET user_metadata = objects.user_metadata RETURNING (SELECT public FROM buckets WHERE id = $1), \
+			set_config('storage.operation', 'storage.object.upload', true)";
+		let old = TenantLayout::default();
+		assert!(!old.is_new());
+		assert!(matches!(old.sql(sql), std::borrow::Cow::Borrowed(_)));
+		let renamed = TenantLayout {
+			has_new_roles: true,
+			schema: "snout_files".into(),
+			extensions: "snout_ext".into(),
+		};
+		assert!(renamed.is_new());
+		assert_eq!(
+			renamed.sql(sql),
+			"INSERT INTO files (bucket_id, name) VALUES ($1, $2) ON CONFLICT (bucket_id, name) \
+			DO UPDATE SET user_metadata = files.user_metadata RETURNING (SELECT public FROM spaces WHERE id = $1), \
+			set_config('storage.operation', 'storage.object.upload', true)"
+		);
+		assert_eq!(
+			renamed.sql("SELECT 1 FROM snout_files.objects o WHERE o.bucket_id = $1"),
+			"SELECT 1 FROM snout_files.files o WHERE o.bucket_id = $1"
+		);
+	}
+}

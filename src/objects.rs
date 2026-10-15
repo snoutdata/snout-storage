@@ -2005,11 +2005,11 @@ async fn list_objects(
 	} else {
 		"ASC"
 	};
-	let sql = list_v1_sql(&column, direction);
 	let target = format!("{safe_prefix}{safe_search}");
 	let limit = limit.unwrap_or(100).min(1500);
 	let offset = offset.unwrap_or(0);
 	let scope = ctx.scope(&app).await?;
+	let sql = list_v1_sql(scope.schema(), &column, direction);
 	let row = scope
 		.query_opt(&sql, &[&bucket, &target, &levels, &offset, &limit])
 		.await?;
@@ -2028,7 +2028,7 @@ async fn list_objects(
 /// Sorted by name, the match is case-insensitive and folders and objects interleave in byte order
 /// of the lower-cased key. Sorted by a date, folders come first (by name), then the objects, and
 /// `$2` is an ILIKE pattern (escaped by the caller).
-fn list_v1_sql(column: &str, direction: &str) -> String {
+fn list_v1_sql(schema: &str, column: &str, direction: &str) -> String {
 	let entry = format!(
 		"json_build_object('name', name, 'id', id, 'updated_at', {}, 'created_at', {}, 'last_accessed_at', {}, 'metadata', metadata)",
 		iso("updated_at"),
@@ -2040,7 +2040,7 @@ fn list_v1_sql(column: &str, direction: &str) -> String {
 			"WITH m AS ( \
 			   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, lower(o.name) AS lname, \
 			          strpos(substr(lower(o.name), length(lower($2::text)) + 1), '/') AS cut \
-			   FROM storage.objects o WHERE o.bucket_id = $1 AND starts_with(lower(o.name), lower($2::text)) \
+			   FROM {schema}.objects o WHERE o.bucket_id = $1 AND starts_with(lower(o.name), lower($2::text)) \
 			 ), listed AS ( \
 			   (SELECT DISTINCT ON (left(lname, length(lower($2::text)) + cut)) \
 			           left(lname, length(lower($2::text)) + cut) AS sort_key, \
@@ -2060,10 +2060,10 @@ fn list_v1_sql(column: &str, direction: &str) -> String {
 			"WITH listed AS ( \
 			   (SELECT 0 AS branch, folder AS folder_name, NULL::timestamptz AS sort_value, folder AS name, NULL::uuid AS id, \
 			           NULL::timestamptz AS updated_at, NULL::timestamptz AS created_at, NULL::timestamptz AS last_accessed_at, NULL::jsonb AS metadata \
-			    FROM (SELECT path_tokens[$3] AS folder FROM storage.objects \
+			    FROM (SELECT path_tokens[$3] AS folder FROM {schema}.objects \
 			          WHERE name ILIKE $2::text || '%' AND bucket_id = $1 AND array_length(path_tokens, 1) <> $3 GROUP BY 1) f) \
 			   UNION ALL \
-			   (SELECT 1, NULL, {column}, path_tokens[$3], id, updated_at, created_at, last_accessed_at, metadata FROM storage.objects \
+			   (SELECT 1, NULL, {column}, path_tokens[$3], id, updated_at, created_at, last_accessed_at, metadata FROM {schema}.objects \
 			    WHERE name ILIKE $2::text || '%' AND bucket_id = $1 AND array_length(path_tokens, 1) = $3) \
 			 ), page AS ( \
 			   SELECT * FROM listed ORDER BY branch, folder_name {direction}, sort_value {direction} OFFSET $4 LIMIT $5 \
@@ -2084,7 +2084,7 @@ fn list_v1_sql(column: &str, direction: &str) -> String {
 ///
 /// By a date: each folder dated by its oldest object's creation, then by name to break ties, and
 /// the cursor is the (date, name) pair.
-fn list_v2_delimited_sql(by_date: Option<&str>, direction: &str) -> String {
+fn list_v2_delimited_sql(schema: &str, by_date: Option<&str>, direction: &str) -> String {
 	let asc = direction == "ASC";
 	let entry = "json_build_object('key', split_part(name, '/', $3), 'name', name, 'id', id, 'updated_at', updated_at, \
 	             'created_at', created_at, 'last_accessed_at', last_accessed_at, 'metadata', metadata)::text";
@@ -2098,12 +2098,12 @@ fn list_v2_delimited_sql(by_date: Option<&str>, direction: &str) -> String {
 			format!(
 				"WITH cursor AS ( \
 				   SELECT CASE WHEN $5::text = '' THEN NULL \
-				               WHEN EXISTS (SELECT FROM storage.objects WHERE bucket_id = $1 AND name COLLATE \"C\" LIKE $5::text || '/%') \
+				               WHEN EXISTS (SELECT FROM {schema}.objects WHERE bucket_id = $1 AND name COLLATE \"C\" LIKE $5::text || '/%') \
 				               THEN {folder_seek} ELSE {object_seek} END AS seek \
 				 ), m AS ( \
 				   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, \
 				          strpos(substr(o.name, length($2::text) + 1), '/') AS cut \
-				   FROM storage.objects o, cursor c \
+				   FROM {schema}.objects o, cursor c \
 				   WHERE o.bucket_id = $1 AND starts_with(o.name, $2::text) \
 				     AND (c.seek IS NULL OR o.name COLLATE \"C\" {compare} c.seek COLLATE \"C\") \
 				 ), listed AS ( \
@@ -2124,7 +2124,7 @@ fn list_v2_delimited_sql(by_date: Option<&str>, direction: &str) -> String {
 				   SELECT o.name, o.id, o.updated_at, o.created_at, o.last_accessed_at, o.metadata, \
 				          CASE WHEN strpos(substr(o.name, length($2::text) + 1), '/') > 0 \
 				               THEN left(o.name, length($2::text) + strpos(substr(o.name, length($2::text) + 1), '/')) END AS folder \
-				   FROM storage.objects o WHERE o.bucket_id = $1 AND o.name COLLATE \"C\" LIKE $2::text || '%' \
+				   FROM {schema}.objects o WHERE o.bucket_id = $1 AND o.name COLLATE \"C\" LIKE $2::text || '%' \
 				 ), listed AS ( \
 				   SELECT rtrim(folder, '/') AS name, NULL::uuid AS id, min(created_at) AS updated_at, min(created_at) AS created_at, \
 				          NULL::timestamptz AS last_accessed_at, NULL::jsonb AS metadata \
@@ -2327,7 +2327,7 @@ async fn list_v2(
 		let by_date = column
 			.as_deref()
 			.filter(|c| *c == "updated_at" || *c == "created_at");
-		let sql = list_v2_delimited_sql(by_date, direction);
+		let sql = list_v2_delimited_sql(scope.schema(), by_date, direction);
 		let start = start_after.clone().unwrap_or_default();
 		let page = (limit + 1).min(1500);
 		let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =

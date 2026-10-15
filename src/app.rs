@@ -267,8 +267,73 @@ pub(crate) async fn route_not_found(method: Method, uri: Uri) -> Response {
 	(StatusCode::NOT_FOUND, json_response(body.to_string())).into_response()
 }
 
+/// The resumable upload path in the new vocabulary (OWN-LAYOUT 2e), served beside `TUS_URL_PATH`.
+pub const TUS_NEW_PATH: &str = "/upload/resume";
+
+/// A path in the new vocabulary (OWN-LAYOUT 2e), as the old one this server routes: `/space` is
+/// `/bucket`, `/file` is `/object`, `/image` is `/render/image`, and in the segment after those
+/// `member` is `authenticated` and `signed` is `sign`. `None` for a path that is already old (or
+/// neither). The resumable upload is not here: it is served at its own path (`TUS_NEW_PATH`), so
+/// the `Location` it answers stays in the vocabulary it was asked in.
+///
+/// `member` and `signed` are renamed only in the shape the route table gives the old words: a
+/// space and a non-empty name after them (`/object/authenticated/{bucket}/{*name}`,
+/// `/object/sign/{bucket}/{*name}` and the `info`, `upload` and image forms of them), or, for
+/// `signed` directly under `/file`, a POST with a space alone (`/object/sign/{bucket}`, signing
+/// several). Anything else is the space of that name: `/file/member/a.png` is the file `a.png`
+/// in the space `member`.
+pub fn old_path(path: &str, method: &Method) -> Option<String> {
+	/// `rest` begins with `/`, or is empty. After `info` or `upload` it is the next segment that
+	/// may be renamed. `file`: under `/file`, where `/object/sign/{bucket}` exists.
+	fn words(rest: &str, method: &Method, file: bool) -> String {
+		let mut parts: Vec<&str> = rest.split('/').collect();
+		let at = if matches!(parts.get(1), Some(&"info") | Some(&"upload")) {
+			2
+		} else {
+			1
+		};
+		let space = parts.get(at + 1).is_some_and(|s| !s.is_empty());
+		let name = parts.len() > at + 2 && !parts[at + 2..].concat().is_empty();
+		let sign_many = file && at == 1 && *method == Method::POST && parts.len() == at + 2;
+		let renamed = match parts.get(at) {
+			Some(&"member") if space && name => Some("authenticated"),
+			Some(&"signed") if space && (name || sign_many) => Some("sign"),
+			_ => None,
+		};
+		if let Some(word) = renamed {
+			parts[at] = word;
+		}
+		parts.join("/")
+	}
+	let (head, rest) = match path.get(1..)?.find('/') {
+		Some(i) => (&path[..i + 1], &path[i + 1..]),
+		None => (path, ""),
+	};
+	match head {
+		"/space" => Some(format!("/bucket{rest}")),
+		"/file" => Some(format!("/object{}", words(rest, method, true))),
+		"/image" => Some(format!("/render/image{}", words(rest, method, false))),
+		_ => None,
+	}
+}
+
+/// Rewrites a new-vocabulary path to the old one before routing, query kept.
+async fn speak_old(mut request: axum::extract::Request) -> axum::extract::Request {
+	if let Some(old) = old_path(request.uri().path(), request.method()) {
+		let rebuilt = match request.uri().query() {
+			Some(query) => format!("{old}?{query}"),
+			None => old,
+		};
+		if let Ok(uri) = rebuilt.parse::<Uri>() {
+			*request.uri_mut() = uri;
+		}
+	}
+	request
+}
+
 pub fn public_router(state: AppState) -> Router {
-	Router::new()
+	let tus_new = TUS_NEW_PATH != state.config.tus_path.trim_end_matches('/');
+	let routes = Router::new()
 		.route("/status", get(|| async { StatusCode::OK }))
 		// The storage API version whose HTTP surface this serves, which is what a client asking
 		// `/version` is asking about. Our own build is in the `version` subcommand and the logs.
@@ -292,9 +357,18 @@ pub fn public_router(state: AppState) -> Router {
 			Router::new()
 		})
 		.merge(crate::tus::routes(&state.config.tus_path))
+		.merge(if tus_new {
+			crate::tus::routes(TUS_NEW_PATH)
+		} else {
+			Router::new()
+		})
 		.merge(crate::objects::routes())
 		.fallback(route_not_found)
-		.with_state(state)
+		.with_state(state);
+	// Both vocabularies: a new path is rewritten to the old before the routes above see it.
+	Router::new()
+		.fallback_service(routes)
+		.layer(axum::middleware::map_request(speak_old))
 }
 
 pub fn admin_router(state: AppState) -> Router {
@@ -801,4 +875,122 @@ async fn admin_delete(
 	app.registry.delete(&id).await?;
 	app.pools.forget(&id).await;
 	Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod vocabulary {
+	use super::old_path;
+	use axum::http::Method;
+
+	fn get(path: &str) -> Option<String> {
+		old_path(path, &Method::GET)
+	}
+
+	#[test]
+	fn every_new_path_is_routed_as_the_old_one() {
+		let cases = [
+			("/space", "/bucket"),
+			("/space/avatars", "/bucket/avatars"),
+			("/space/avatars/empty", "/bucket/avatars/empty"),
+			("/file/avatars/a/b.png", "/object/avatars/a/b.png"),
+			("/file/avatars", "/object/avatars"),
+			("/file/public/avatars/a.png", "/object/public/avatars/a.png"),
+			(
+				"/file/member/avatars/a.png",
+				"/object/authenticated/avatars/a.png",
+			),
+			("/file/signed/avatars/a.png", "/object/sign/avatars/a.png"),
+			(
+				"/file/upload/signed/avatars/a.png",
+				"/object/upload/sign/avatars/a.png",
+			),
+			(
+				"/file/info/member/avatars/a.png",
+				"/object/info/authenticated/avatars/a.png",
+			),
+			(
+				"/file/info/public/avatars/a.png",
+				"/object/info/public/avatars/a.png",
+			),
+			("/file/info/avatars/a.png", "/object/info/avatars/a.png"),
+			("/file/list/avatars", "/object/list/avatars"),
+			("/file/list-v2/avatars", "/object/list-v2/avatars"),
+			("/file/move", "/object/move"),
+			("/file/copy", "/object/copy"),
+			(
+				"/image/public/avatars/a.png",
+				"/render/image/public/avatars/a.png",
+			),
+			(
+				"/image/member/avatars/a.png",
+				"/render/image/authenticated/avatars/a.png",
+			),
+			(
+				"/image/signed/avatars/a.png",
+				"/render/image/sign/avatars/a.png",
+			),
+		];
+		for (new, old) in cases {
+			assert_eq!(get(new).as_deref(), Some(old), "{new}");
+		}
+		// Signing several names in one space: a POST with the space alone.
+		assert_eq!(
+			old_path("/file/signed/avatars", &Method::POST).as_deref(),
+			Some("/object/sign/avatars")
+		);
+	}
+
+	#[test]
+	fn a_space_named_like_a_word_keeps_its_name() {
+		for (new, old) in [
+			// The space itself, and a file in it: no space-and-name follows the word.
+			("/file/member", "/object/member"),
+			("/file/signed", "/object/signed"),
+			("/file/member/a.png", "/object/member/a.png"),
+			("/file/signed/a.png", "/object/signed/a.png"),
+			("/file/member/folder/", "/object/member/folder/"),
+			("/file/info/member/a.png", "/object/info/member/a.png"),
+			("/file/info/signed/a.png", "/object/info/signed/a.png"),
+			("/file/upload/signed/a.png", "/object/upload/signed/a.png"),
+			("/image/member/a.png", "/render/image/member/a.png"),
+			("/image/signed/a.png", "/render/image/signed/a.png"),
+			// The real forms, inside a space of that name.
+			(
+				"/file/member/member/a.png",
+				"/object/authenticated/member/a.png",
+			),
+			("/file/signed/signed/a.png", "/object/sign/signed/a.png"),
+		] {
+			assert_eq!(get(new).as_deref(), Some(old), "{new}");
+		}
+		// An upload into the space `signed` is not signing: only a POST of the space alone is.
+		assert_eq!(
+			old_path("/file/signed/a.png", &Method::PUT).as_deref(),
+			Some("/object/signed/a.png")
+		);
+		assert_eq!(
+			old_path("/image/signed/a.png", &Method::POST).as_deref(),
+			Some("/render/image/signed/a.png")
+		);
+		assert_eq!(
+			old_path("/file/member/a.png", &Method::POST).as_deref(),
+			Some("/object/member/a.png")
+		);
+	}
+
+	#[test]
+	fn old_paths_and_others_are_left_alone() {
+		for path in [
+			"/bucket",
+			"/object/avatars/a.png",
+			"/render/image/public/a/b",
+			"/upload/resumable",
+			"/upload/resume",
+			"/status",
+			"/files",
+			"/",
+		] {
+			assert_eq!(get(path), None, "{path}");
+		}
+	}
 }
